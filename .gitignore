@@ -1,0 +1,14 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Harness scratch / downloaded (not-cached) data
+raw_data/
+sim_data/*.npy
+sim_data/corpus/
+sim/*.vvp
+*.vcd
+
+# OS
+.DS_Store
