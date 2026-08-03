@@ -1,0 +1,17 @@
+dataset,ch,samples,model,bits_per_sample,ratio,embedded_ok
+hyser_1dof_f1_s1,128,51200,delta+Rice,12.2124,1.3101,yes
+hyser_1dof_f1_s1,128,51200,LMS+Rice,12.0727,1.3253,yes
+hyser_1dof_f1_s1,128,51200,LMS4+Rice+xchan_bestpartner,10.8284,1.4776,yes
+hyser_1dof_f1_s1,128,51200,lm_probe,10.9239,1.4647,no
+otb_hdsemg_vl,64,66560,delta+Rice,9.2003,1.7391,yes
+otb_hdsemg_vl,64,66560,LMS+Rice,8.9093,1.7959,yes
+otb_hdsemg_vl,64,66560,LMS4+Rice+xchan_bestpartner,7.4232,2.1554,yes
+otb_hdsemg_vl,64,66560,lm_probe,7.3526,2.1761,no
+cemhsey_s1_d1t1,320,61500,delta+Rice,9.5708,1.6718,yes
+cemhsey_s1_d1t1,320,61500,LMS+Rice,9.2782,1.7245,yes
+cemhsey_s1_d1t1,320,61500,LMS4+Rice+xchan_bestpartner,8.1843,1.9550,yes
+cemhsey_s1_d1t1,320,61500,lm_probe,8.3519,1.9157,no
+capgmyo_dba_s1,128,25000,delta+Rice,11.8955,1.3451,yes
+capgmyo_dba_s1,128,25000,LMS+Rice,11.4685,1.3951,yes
+capgmyo_dba_s1,128,25000,LMS4+Rice+xchan_bestpartner,11.2647,1.4204,yes
+capgmyo_dba_s1,128,25000,lm_probe,11.0505,1.4479,no

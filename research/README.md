@@ -24,6 +24,7 @@ The top-level [`../README.md`](../README.md) is the front door; start there.
 | `datasets.py` | the corpus loader (synthetic sweeps + real Hyser/OTB/CapgMyo/CEMHSEY, cached under `../sim_data/corpus_npz/`) |
 | `bench.py` | per-codec × dataset benchmark → `../results/*.csv` |
 | `search.py` | hill-climb the design space subject to `embedded_ok`; ablations + Pareto front |
+| `lm_probe.py` | **learned-model headroom probe** (LMCompress-style): MLP → discretised-logistic NLL = ideal code length, vs the real champion on a held-out tail; `--selftest` checks pmf + gradients. Measures a ceiling, ships no codec — see `experiments/015_*` |
 | `bootstrap.sh` | idempotent env setup for an ephemeral session |
 | `ROUTINE_PROMPT.md` | the scheduled-routine prompt that runs a committed cycle |
 
