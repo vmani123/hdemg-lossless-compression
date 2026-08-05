@@ -2325,6 +2325,563 @@ def rsbp_decode(buf):
 
 
 # ===========================================================================
+# NEW candidate: lag-matched (SPATIOTEMPORAL) cross-channel partner
+# (LMS4+Rice+xchan_lagpartner).
+# ---------------------------------------------------------------------------
+# Every cross-channel front-end in this registry -- +xchan, bestpartner,
+# multiparent, joint2, jointbp2, acar -- subtracts the parent at ZERO TIME LAG:
+# it predicts x[c,t] from x[p,t]. So every one of them measures (and can only
+# remove) the neighbour mutual information at tau=0. INSIGHTS P1 says the spatial
+# gain is bounded by "the real neighbour correlation"; cycles 10-15 then showed a
+# whole family of tau=0 re-slicings landing within ~1% of a shared ceiling. This
+# candidate does NOT re-divide the tau=0 MI -- it moves the measurement point.
+#
+# Physics: HD-sEMG is dominated by motor-unit action potentials PROPAGATING along
+# the muscle fibre at a conduction velocity of ~3-5 m/s. Two electrodes separated
+# by the inter-electrode distance (8 mm on the OTB 5x13, 10 mm on the Hyser 8x16)
+# therefore see the SAME MUAP separated by tau* = IED/CV ~ 1.6-3.3 ms, i.e. 3-7
+# samples at 2048 Hz. At the dominant 80-120 Hz sEMG band that is roughly a 90
+# degree phase error, so the propagating component of the shared source is
+# structurally close to INVISIBLE to a zero-lag subtract: the inter-electrode
+# cross-correlation peaks at tau* != 0, not at 0. Aligning the parent to that peak
+# moves the residual variance from (1-rho(0)^2) to (1-rho(tau*)^2), a per-sample
+# saving of 1/2 * log2((1-rho(0)^2)/(1-rho(tau*)^2)) bits. This is the delay that
+# standard HD-sEMG conduction-velocity estimation (Farina & Merletti) measures --
+# a NEW slice of the cross-channel MI, not a re-slice of the tau=0 one. (No
+# paper-reported compression ratio is claimed; the mechanism is the claim.)
+#
+# Mechanism: keep the proven rank-1 adaptive cross-channel subtract exactly as it
+# is (INSIGHTS P3: rank-1 data-dependent, residual-only injection, parent rows
+# left clean), and extend the backward per-block selection from a partner p to a
+# (partner p, integer lag tau) PAIR:
+#     y[c,t] = x[c,t] - ((beta * x[p, t-tau]) >> BP_SHIFT)
+# Selection is backward-adaptive per block (INSIGHTS P4, verbatim structure from
+# `bestpartner_adaptive`): from the PREVIOUS already-reconstructed RAW block, for
+# each causal grid neighbour (idx < c) and each lag, derive the integer
+# least-squares gain (`_bp_opt_beta`) and score the resulting cross-residual in
+# estimated Rice bits (`_bp_score`); the no-partner option is scored too. ZERO
+# side-info: the decoder recomputes the identical (p, tau, beta).
+#
+# COARSE->FINE, SUBSAMPLED lag search (the embeddability lever): a naive scan is
+# 4 parents x 15 lags, which would not fit the tight 125 cyc/sample-ch neural
+# budget. Stage 1 scans the 4 parents over a stride-2 COARSE lag grid
+# (tau = -6,-4,...,+6) on a stride-2 DECIMATED copy of the previous block (the
+# lag is applied BEFORE decimation, so lag resolution is preserved -- only the
+# correlation estimate uses half the samples); stage 2 re-scores only the winning
+# cell's tau-1/tau/tau+1 at FULL rate and commits. Coarse scores are only ever
+# compared against coarse scores and fine against fine, so the two rates are never
+# mixed. tau=0 is on the coarse grid and reachable at the fine stage, so the codec
+# DEGENERATES GRACEFULLY to the proven zero-lag rank-1 subtract wherever the lag
+# buys nothing -- which is the expected outcome on CapgMyo, whose differential
+# array has already cancelled the shared propagating mode (the honest negative
+# control, consistent with P1, not a failure).
+#
+# Look-ahead: a SIGNED tau is required by the physics -- the innervation zone sits
+# mid-array, so MUAPs propagate towards the tendons in BOTH directions and a
+# causal neighbour (idx<c) can equally lead or lag channel c. Negative tau costs
+# the ENCODER a bounded |tau| <= LAGP_MAX = 7 samples (~3.4 ms) of look-ahead on
+# the parent's delay line; the DECODER needs none, because the channel-sequential
+# decode order has parent row p (< c) fully reconstructed before channel c starts.
+# 7 samples is two orders of magnitude inside the 4096-sample streaming gate and
+# far below the block-sized look-ahead the offline bestpartner front-ends already
+# carry; a tau>=0-only variant would be strictly look-ahead-0 at the cost of one
+# propagation direction. Extra persistent state is one 2*LAGP_MAX+1 = 15-deep
+# int16 delay line per channel (30 B/ch) so any channel can serve as a lagged
+# parent -- negligible against the SRAM/BRAM budget.
+#
+# Distinct from every retired mechanism: it is not a multi-tap/energy-preserving
+# inter-channel rotation (P3, `iklt`/`iklt_adaptive` -- this stays rank-1 and
+# leaves the parent clean), not a summed multi-parent subtract (P1b,
+# `xchan_multiparent` -- still exactly ONE parent, so nothing can double-count),
+# not an entropy back-end or Rice-parameter context lever (P5, `xchan_tans`/
+# `xctx` -- the coder is untouched adaptive Rice), and not a predictor
+# coefficient-set bank (P2, `LMS4rs` -- the temporal predictor is the same single
+# order-4 sign-sign LMS). It is `bestpartner_adaptive` with the selection domain
+# widened from {partner} to {partner} x {lag}.
+# ===========================================================================
+LAGP_MAGIC = 0x474C          # 'LG' (lag-matched cross-channel partner)
+LAGP_BLOCK = ec.BLOCK        # re-selection block (aligns with the Rice block)
+LAGP_MAX = 7                 # max |tau| in samples (~3.4 ms at 2048 Hz)
+LAGP_COARSE = tuple(range(-6, 7, 2))   # coarse lag grid: -6,-4,-2,0,2,4,6
+LAGP_DECIM = 2               # subsample stride for the COARSE scan only
+
+
+def _lag_ref(xp, s, e, tau, N):
+    """The lag-tau parent reference for output samples t in [s, e):
+        ref[t-s] = xp[t-tau],  with 0 substituted outside [0, N).
+    Integer-only, and identical in encoder and decoder -- the parent row is fully
+    available on both sides (encoder: bounded |tau|<=LAGP_MAX look-ahead on the
+    parent delay line; decoder: parent idx < c is already reconstructed), so the
+    zero padding at the record edges is part of the FORMAT, not an approximation."""
+    out = np.zeros(e - s, np.int64)
+    lo, hi = s - tau, e - tau
+    a, b = max(lo, 0), min(hi, N)
+    if b > a:
+        out[a - lo:b - lo] = xp[a:b]
+    return out
+
+
+def _lagp_cand_bits(xc_prev, ref, decim=1):
+    """Score one (partner, lag) candidate over the previous block: derive the
+    integer least-squares gain (`_bp_opt_beta`, reused verbatim from the proven
+    best-partner path) and return (estimated Rice bits, beta) for the resulting
+    rank-1 cross-residual. `decim` subsamples the SCORING only (the lag has
+    already been applied to `ref`), so lag resolution is untouched. Returns
+    (None, 0) when the gain rounds to zero, i.e. the candidate is useless."""
+    a = xc_prev[::decim] if decim > 1 else xc_prev
+    b = ref[::decim] if decim > 1 else ref
+    beta = _bp_opt_beta(a, b, BP_SHIFT)
+    if beta == 0:
+        return None, 0
+    resid = a - ((beta * b) >> BP_SHIFT)
+    return _bp_score(resid), beta
+
+
+def _lagp_select_block(xc_prev, x, cands, ps, pe, N):
+    """Backward per-block (partner, lag, beta) selection from the PREVIOUS raw
+    block via a coarse->fine, subsampled lag search. Returns (-1, 0, 0) when no
+    lagged partner beats coding the channel as-is. Integer-only and fully
+    deterministic, and both sides hold the bit-identical previous block and the
+    identical parent rows, so encoder and decoder derive the SAME triple."""
+    # --- stage 1: coarse lag grid, DECIMATED scoring (coarse vs coarse only) ---
+    c_bits, c_p, c_tau = None, -1, 0
+    for p in cands:
+        xp = x[p]
+        for tau in LAGP_COARSE:
+            bits, _ = _lagp_cand_bits(xc_prev, _lag_ref(xp, ps, pe, tau, N),
+                                      LAGP_DECIM)
+            if bits is not None and (c_bits is None or bits < c_bits):
+                c_bits, c_p, c_tau = bits, p, tau
+    # --- stage 2: refine tau by +/-1 at FULL rate, vs the no-partner option ---
+    best_bits = _bp_score(xc_prev)          # option: no cross-channel subtract
+    best_p, best_tau, best_beta = -1, 0, 0
+    if c_p >= 0:
+        xp = x[c_p]
+        for tau in (c_tau - 1, c_tau, c_tau + 1):
+            if abs(tau) > LAGP_MAX:
+                continue
+            bits, beta = _lagp_cand_bits(xc_prev, _lag_ref(xp, ps, pe, tau, N))
+            if bits is not None and bits < best_bits:
+                best_bits, best_p, best_tau, best_beta = bits, c_p, tau, beta
+    return best_p, best_tau, best_beta
+
+
+def _lagp_forward(x, cols, B=LAGP_BLOCK):
+    """Rank-1 cross-channel subtract with a backward-adaptive per-block
+    (partner, LAG, gain). Block i's triple comes from the PREVIOUS raw block
+    (block 0 -> no partner, no prior block exists); the subtract is applied to
+    block i of the RAW signal at the selected lag."""
+    C, N = x.shape
+    x = x.astype(np.int64)
+    y = x.copy()
+    nblocks = (N + B - 1) // B
+    for g in range(C):
+        cands = _bp_candidates(g, cols, C)
+        if not cands:                          # grid origin: no causal neighbour
+            continue
+        for i in range(1, nblocks):            # block 0 is coded as-is
+            s, e = i * B, min((i + 1) * B, N)
+            ps, pe = (i - 1) * B, i * B
+            p, tau, beta = _lagp_select_block(x[g, ps:pe], x, cands, ps, pe, N)
+            if p >= 0:
+                ref = _lag_ref(x[p], s, e, tau, N)
+                y[g, s:e] = x[g, s:e] - ((beta * ref) >> BP_SHIFT)
+    return y
+
+
+def _lagp_inverse(y, cols, B=LAGP_BLOCK):
+    """Invert `_lagp_forward`. Every candidate partner has grid idx < g, so its
+    row is FULLY reconstructed before channel g is touched -- which is exactly why
+    a signed (negative) lag costs the decoder no look-ahead. Within a channel we
+    rebuild raw block-by-block in time order, so block i-1 is restored before the
+    selection for block i is recomputed from it, mirroring the encoder exactly."""
+    C, N = y.shape
+    y = y.astype(np.int64)
+    x = y.copy()
+    nblocks = (N + B - 1) // B
+    for g in range(C):
+        cands = _bp_candidates(g, cols, C)
+        if not cands:
+            continue
+        for i in range(1, nblocks):
+            s, e = i * B, min((i + 1) * B, N)
+            ps, pe = (i - 1) * B, i * B
+            p, tau, beta = _lagp_select_block(x[g, ps:pe], x, cands, ps, pe, N)
+            if p >= 0:
+                ref = _lag_ref(x[p], s, e, tau, N)
+                x[g, s:e] = y[g, s:e] + ((beta * ref) >> BP_SHIFT)
+    return x
+
+
+def lagp_encode(x, cols=16):
+    x = np.asarray(x, np.int64)
+    C, N = x.shape
+    y = _lagp_forward(x, cols)                       # lag-matched rank-1 subtract
+    res = ec.lms_forward(y, order=LMS4_ORDER)        # order-4 sign-sign LMS (P2)
+    body = b"".join(ec.rice_encode_1d(res[c]) for c in range(C))
+    hdr = struct.pack("<HHII", LAGP_MAGIC, cols, C, N)   # NO side-info at all
+    return hdr + body
+
+
+def lagp_decode(buf):
+    magic, cols, C, N = struct.unpack_from("<HHII", buf, 0)
+    assert magic == LAGP_MAGIC, "bad lag-partner codec magic"
+    off = 12
+    res = np.empty((C, N), np.int64)
+    for c in range(C):
+        arr, off = ec.rice_decode_1d(buf, off)
+        res[c] = arr
+    y = ec.lms_inverse(res, order=LMS4_ORDER)        # matched order-4 inverse
+    x = _lagp_inverse(y, cols)
+    return x.astype(np.int16)
+
+
+# ===========================================================================
+# NEW candidate: MDL-penalized spatial MODEL-ORDER selection
+# (LMS4+Rice+xchan_mdlsel).
+# ---------------------------------------------------------------------------
+# This fixes a diagnosed ESTIMATOR defect in the ACTIVE `xchan_jointbp2`, not a
+# parameter of it. `_jbp2_select_block` scores every option -- none / single
+# parent / joint pair -- with `_bp_score` on a least-squares fit computed on the
+# SAME previous block it is then scored over. That is an IN-SAMPLE comparison
+# between model classes of different order, and it is structurally biased: a
+# 2-parameter joint pair contains the 1-parameter single as a special case
+# (beta_q = 0), so its LS residual on the fitting block can NEVER be larger.
+# Textbook model-order selection with no complexity term always over-selects.
+#
+# That is exactly the observed signature (experiments/012): jointbp2 wins the
+# diffuse large array (Hyser, where the second parent carries real MI, P1b) but
+# regresses on tight OTB, where P1b says the local cross-channel MI is
+# essentially rank-1 and the second tap buys only ESTIMATION VARIANCE -- variance
+# that is invisible in-sample and only shows up as extra coded bits on the NEXT
+# block, which is the block the selection is actually used for.
+#
+# Mechanism (MDL / BIC): the description length of a model class includes the
+# cost of its parameters. Selecting by fit alone provably over-selects; the
+# minimum-description-length criterion adds the parameter code length
+#     penalty(k) = (k/2) * log2(B)   bits,   k = number of spatial taps
+# (k = 0 none, 1 single, 2 joint pair; B = the scored block length). Computed as
+# an exact integer: log2(B) = B.bit_length()-1 (B is the power-of-two Rice
+# block), so on B=256 the penalty is 0 / 4 / 8 bits -- ONE integer add per scored
+# option. A second tap must now pay for itself by more than its own description
+# length before it is selected, so the spatial model ORDER falls out of the data
+# per channel AND per block, at zero side-info. This is a strictly better
+# realization of INSIGHTS frontier #1 than a channel-count gate: a geometry
+# heuristic cannot separate CapgMyo (128 ch, neighbour |corr| 0.29, wants NO
+# second parent) from Hyser (128 ch, high corr, wants one) -- both have C=128.
+# Here the criterion is measured per channel-block, so geometry never has to be
+# guessed.
+#
+# Everything else is jointbp2 VERBATIM -- the transform (joint co-adaptive 2-tap
+# sign-sign LMS on the selected pair, taps persisting, asymmetric rank-1
+# residual-only injection with the parent rows left clean), the order-4 sign-sign
+# LMS temporal predictor (P2) and the adaptive Rice back-end. The ONLY difference
+# is the selection criterion, so a measured delta is attributable to it alone.
+# GUARD (INSIGHTS P5): the penalty gates the TRANSFORM order only. The Rice coder
+# and its k are untouched -- modelling the Rice parameter is the retired `xctx`
+# lever, and this is not that.
+#
+# Distinct from its relatives on the axis each names decisive:
+#   - vs ACTIVE `xchan_jointbp2`: in-sample fit-only score -> MDL-penalized score.
+#     Same candidate set, same transform, same coder, same cost profile.
+#   - vs RETIRED `xchan_multiparent`: summed MARGINAL betas double-count the
+#     parents' shared mode; the pair option here is a JOINT 2x2 LS solve.
+#   - vs RETIRED `xctx`: that modelled the CODER's parameter; this selects the
+#     TRANSFORM's order and leaves the coder alone.
+# Basis: Rissanen's MDL / Schwarz's BIC order selection (textbook), applied to
+# the spatial predictor order. No paper-reported compression ratio is claimed.
+# ===========================================================================
+MDL_MAGIC = 0x444D           # 'MD' (MDL-selected spatial order)
+MDL_SHIFT = ec.CROSS_SHIFT   # fixed-point spatial-tap scale (matches the +xchan family)
+MDL_ORDER = LMS4_ORDER       # order-4 temporal base behind the spatial front-end (P2)
+MDL_BLOCK = ec.BLOCK         # re-selection block (aligns with the Rice block)
+
+
+def _mdl_penalty(k, n):
+    """MDL/BIC parameter code length in bits for a k-tap spatial model fit over n
+    samples: (k/2)*log2(n), as an exact integer (floor log2 via bit_length, then
+    integer-halved). Integer-only and deterministic -> encoder and decoder add the
+    identical penalty. k = 0 (no parent) / 1 (single) / 2 (joint pair)."""
+    if k <= 0 or n <= 1:
+        return 0
+    return (k * (int(n).bit_length() - 1)) // 2
+
+
+def _mdlsel_select_block(xc_prev, x, cands, ps, pe):
+    """Backward per-block selection of the best pair/single/none from the PREVIOUS
+    raw block -- SAME candidate set and SAME fits as `_jbp2_select_block`, but each
+    option is scored as (estimated Rice bits + MDL parameter penalty) instead of
+    coded bits alone. The penalty removes the structural in-sample bias toward the
+    higher-order option. Returns (pu, pl): a jointly-solved pair (both >=0), a
+    single best-partner (pu>=0, pl=-1), or none (-1,-1). Integer-only and
+    deterministic, so encode and decode -- both holding the bit-identical
+    reconstructed previous block -- pick identically."""
+    n = pe - ps
+    pen1 = _mdl_penalty(1, n)                     # one spatial tap
+    pen2 = _mdl_penalty(2, n)                     # two spatial taps
+    best_bits = _bp_score(xc_prev)                # k=0: no parent, no parameter cost
+    best_pu, best_pl = -1, -1
+    for p in cands:                               # single-parent options (marginal LS)
+        b = _bp_opt_beta(xc_prev, x[p, ps:pe], BP_SHIFT)
+        if b == 0:
+            continue
+        bits = _bp_score(xc_prev - ((b * x[p, ps:pe]) >> BP_SHIFT)) + pen1
+        if bits < best_bits:
+            best_bits, best_pu, best_pl = bits, p, -1
+    L = len(cands)                                # joint pair options (2x2 LS)
+    for ii in range(L):
+        for jj in range(ii + 1, L):
+            resid = _jbp2_pair_resid(xc_prev, x[cands[ii], ps:pe], x[cands[jj], ps:pe])
+            if resid is None:
+                continue
+            bits = _bp_score(resid) + pen2
+            if bits < best_bits:
+                best_bits, best_pu, best_pl = bits, cands[ii], cands[jj]
+    return best_pu, best_pl
+
+
+def _mdlsel_forward(x, cols, B=MDL_BLOCK, shift=MDL_SHIFT):
+    """Spatial front-end: per channel c and block i>0 the model ORDER and identity
+    (pair / single / none) are re-selected from the previous raw block under the
+    MDL criterion; block 0 bootstraps to the fixed grid (up,left) pair so the taps
+    warm from t=0. ONE joint co-adaptive 2-tap sign-sign LMS then predicts x[c]
+    from the selected parents, both taps descending the SHARED residual, taps
+    PERSISTING across blocks. Only channel c's residual is modified; the raw parent
+    rows are left clean. Integer-only, per-sample, look-ahead 0."""
+    C, N = x.shape
+    x = x.astype(np.int64)
+    y = x.copy()
+    up, left = _xj2_parents(C, cols)
+    nblocks = (N + B - 1) // B
+    for c in range(C):
+        cands = _bp_candidates(c, cols, C)
+        if not cands:
+            continue                              # grid origin: coded as-is
+        xc = x[c]; yc = y[c]
+        wu = wl = 0
+        for i in range(nblocks):
+            s, e = i * B, min((i + 1) * B, N)
+            if i == 0:
+                pu, pl = int(up[c]), int(left[c])          # fixed-pair bootstrap
+            else:
+                pu, pl = _mdlsel_select_block(x[c, (i - 1) * B:i * B], x, cands,
+                                              (i - 1) * B, i * B)
+            prow = x[pu] if pu >= 0 else None
+            lrow = x[pl] if pl >= 0 else None
+            for t in range(s, e):
+                u = int(prow[t]) if prow is not None else 0
+                l = int(lrow[t]) if lrow is not None else 0
+                pred = (wu * u + wl * l) >> shift
+                ev = int(xc[t]) - pred
+                yc[t] = ev
+                se = 1 if ev > 0 else (-1 if ev < 0 else 0)
+                if prow is not None:
+                    wu += se * (1 if u > 0 else (-1 if u < 0 else 0))
+                if lrow is not None:
+                    wl += se * (1 if l > 0 else (-1 if l < 0 else 0))
+    return y
+
+
+def _mdlsel_inverse(y, cols, B=MDL_BLOCK, shift=MDL_SHIFT):
+    """Invert _mdlsel_forward. Every candidate parent has grid idx < c so its row is
+    fully reconstructed before c; within a channel we rebuild raw block-by-block in
+    time order, so block i-1 is restored before block i and the SAME MDL-penalized
+    selection is re-run on it, with the SAME persistent taps re-derived per sample
+    from the shared residual e=y[c,t] and the reconstructed parents -- mirroring the
+    encoder bit-for-bit."""
+    C, N = y.shape
+    y = y.astype(np.int64)
+    x = y.copy()
+    up, left = _xj2_parents(C, cols)
+    nblocks = (N + B - 1) // B
+    for c in range(C):
+        cands = _bp_candidates(c, cols, C)
+        if not cands:
+            continue
+        yc = y[c]; xc = x[c]
+        wu = wl = 0
+        for i in range(nblocks):
+            s, e = i * B, min((i + 1) * B, N)
+            if i == 0:
+                pu, pl = int(up[c]), int(left[c])
+            else:
+                pu, pl = _mdlsel_select_block(x[c, (i - 1) * B:i * B], x, cands,
+                                              (i - 1) * B, i * B)
+            prow = x[pu] if pu >= 0 else None    # parent idx < c -> already reconstructed
+            lrow = x[pl] if pl >= 0 else None
+            for t in range(s, e):
+                u = int(prow[t]) if prow is not None else 0
+                l = int(lrow[t]) if lrow is not None else 0
+                pred = (wu * u + wl * l) >> shift
+                ev = int(yc[t])
+                xc[t] = ev + pred
+                se = 1 if ev > 0 else (-1 if ev < 0 else 0)
+                if prow is not None:
+                    wu += se * (1 if u > 0 else (-1 if u < 0 else 0))
+                if lrow is not None:
+                    wl += se * (1 if l > 0 else (-1 if l < 0 else 0))
+    return x
+
+
+def mdlsel_encode(x, cols=16):
+    x = np.asarray(x, np.int64)
+    C, N = x.shape
+    y = _mdlsel_forward(x, cols)                 # MDL-selected spatial front-end
+    res = ec.lms_forward(y, order=MDL_ORDER)     # order-4 sign-sign LMS (INSIGHTS P2)
+    body = b"".join(ec.rice_encode_1d(res[c]) for c in range(C))
+    hdr = struct.pack("<HHII", MDL_MAGIC, cols, C, N)   # NO side-info (backward-adaptive)
+    return hdr + body
+
+
+def mdlsel_decode(buf):
+    magic, cols, C, N = struct.unpack_from("<HHII", buf, 0)
+    assert magic == MDL_MAGIC, "bad xchan_mdlsel magic"
+    off = 12
+    res = np.empty((C, N), np.int64)
+    for c in range(C):
+        arr, off = ec.rice_decode_1d(buf, off)
+        res[c] = arr
+    y = ec.lms_inverse(res, order=MDL_ORDER)     # matched order-4 inverse
+    x = _mdlsel_inverse(y, cols)
+    return x.astype(np.int16)
+
+
+# ===========================================================================
+# NEW candidate: innovation-domain cross-channel subtract -- the CASCADE
+# REORDER (LMS4+Rice+xchan_post).
+# ---------------------------------------------------------------------------
+# TOPOLOGY, not a new primitive. EVERY cross-channel codec registered above runs
+# the SAME cascade order: spatial front-end FIRST on the raw signal, then the
+# per-channel temporal predictor on the spatially-decorrelated channels
+# (`_bp_select`/`_lms4bpa_forward`/... -> `ec.lms_forward`). This candidate is the
+# never-measured REVERSE cascade: run the order-4 sign-sign LMS FIRST per channel
+# on the RAW signal, then apply the proven rank-1 backward-adaptive cross-channel
+# subtract to the INNOVATION (whitened residual) sequences:
+#
+#     e = lms4(x)                            per channel, raw input (INSIGHTS P2)
+#     z[c, blk i] = e[c, blk i] - ((beta * e[p, blk i]) >> BP_SHIFT)
+#
+# with (p, beta) re-selected per block from the PREVIOUS block of the INNOVATIONS
+# by the identical estimator the promoted-best-partner path uses (`_bp_candidates`
+# 4-neighbourhood, `_bp_opt_beta` integer least-squares gain, `_bp_score` Rice-bits
+# scoring, no-partner option included -- `_bpa_select_block` is reused VERBATIM,
+# just fed `e` instead of `x`). Two information-theoretic reasons the reordered
+# cascade should code fewer bits:
+#   (i) STAGEWISE OBJECTIVE MISMATCH. Today the spatial stage minimizes RAW
+#       residual power via a broadband least-squares beta, but the quantity that
+#       is actually coded is the residual AFTER temporal whitening. The weight
+#       that minimizes coded entropy is the ratio of INNOVATION cross-spectra,
+#       which in general is NOT the raw-domain beta (they coincide only if both
+#       channels share one whitening filter and the cross-spectrum is flat).
+#       Doing the subtract in the innovation domain makes the greedy stage
+#       minimize the objective the entropy coder actually pays for.
+#  (ii) THE MIXTURE IS HARDER TO WHITEN. x[c] - beta*x[p] mixes two AR processes,
+#       and a sum of AR(p) processes is ARMA of higher order than either, so the
+#       FIXED order-4 whitener that INSIGHTS P2 mandates systematically under-fits
+#       the very signal the current cascade hands it. Temporal-first never creates
+#       that mixture: each order-4 predictor sees a single un-mixed AR channel,
+#       and the spatial stage then acts on already-white sequences.
+# RISK the measurement must settle: innovations are near-white and low-amplitude,
+# so the spatial estimator sees a lower-SNR gradient and may adapt noisily. The
+# stated mitigation is a LONGER spatial adaptation time-constant, so the
+# re-selection block is XPOST_BLOCK = 4 * ec.BLOCK = 1024 samples (the Rice
+# back-end keeps its own 256-sample k blocks). That is cost-neutral: the backward
+# scan still touches B previous samples per B current samples, so ops/sample-ch
+# and per-channel state are UNCHANGED -- only the averaging window is longer.
+#
+# INVERTIBILITY (matched pair, zero side-info). The decoder Rice-decodes z, walks
+# channels in increasing grid index -- every candidate partner has idx < g, so
+# e[p] is fully restored before channel g is touched -- and within a channel walks
+# blocks in time order, so block i-1 of e[g] is restored before block i and the
+# SAME (partner, beta) is recomputed from bit-identical data. Then ONE matched
+# order-4 `ec.lms_inverse` recovers x. Nothing is transmitted (no parent/beta
+# header), look-ahead 0. Block 0 bootstraps to no-partner.
+# ASYMMETRY (INSIGHTS P3): still a rank-1 subtract that injects estimation noise
+# only into channel g's coded residual and leaves the parent's innovation row
+# CLEAN -- NOT a multi-tap or energy-preserving inter-channel rotation (the
+# retired iklt/iklt_adaptive dead end), and NOT a summed multi-parent (retired).
+# The temporal predictor's order (4) and functional form, the 4-candidate causal
+# neighbourhood, the integer-LS beta, the Rice-bits criterion and the adaptive
+# Rice back-end (INSIGHTS P5) are all held FIXED, so a measured delta against
+# `LMS4+Rice+xchan_bestpartner_adaptive` -- the same estimator in the raw domain --
+# is attributable to the cascade ORDER (and its window) alone.
+# ===========================================================================
+XPOST_MAGIC = 0x5850          # 'PX' (post-whitening cross-channel subtract)
+XPOST_ORDER = LMS4_ORDER      # order-4 temporal predictor (INSIGHTS P2), unchanged
+# Longer spatial adaptation time-constant (the stated mitigation for the
+# lower-SNR innovation-domain gradient): 4x the Rice block. Cost-neutral -- the
+# backward scan rate per sample is unchanged, only the averaging window grows.
+XPOST_BLOCK = 4 * ec.BLOCK    # 1024-sample spatial re-selection block
+
+
+def _xpost_forward(e, cols, B=XPOST_BLOCK):
+    """Rank-1 backward-adaptive cross-channel subtract applied to the INNOVATION
+    array e (post-temporal-whitening), block i's (partner, beta) selected from
+    block i-1 of the innovations by `_bpa_select_block` (verbatim estimator).
+    Block 0 has no prior block -> coded as-is. Returns the [C, N] int64 stream."""
+    C, N = e.shape
+    e = e.astype(np.int64)
+    z = e.copy()
+    nblocks = (N + B - 1) // B
+    for g in range(C):
+        cands = _bp_candidates(g, cols, C)
+        if not cands:                          # grid origin: no causal neighbour
+            continue
+        for i in range(1, nblocks):
+            s, t = i * B, min((i + 1) * B, N)
+            ps, pe = (i - 1) * B, i * B
+            p, b = _bpa_select_block(e[g, ps:pe], e, cands, ps, pe)
+            if p >= 0:
+                z[g, s:t] = e[g, s:t] - ((b * e[p, s:t]) >> BP_SHIFT)
+    return z
+
+
+def _xpost_inverse(z, cols, B=XPOST_BLOCK):
+    """Invert `_xpost_forward`. Channels ascend (every candidate partner has grid
+    idx < g, so its innovation row is fully restored first) and, within a channel,
+    blocks ascend in time (block i-1 restored before block i), so the decoder
+    recomputes the IDENTICAL per-block (partner, beta) from bit-identical data."""
+    C, N = z.shape
+    z = z.astype(np.int64)
+    e = z.copy()
+    nblocks = (N + B - 1) // B
+    for g in range(C):
+        cands = _bp_candidates(g, cols, C)
+        if not cands:
+            continue
+        for i in range(1, nblocks):
+            s, t = i * B, min((i + 1) * B, N)
+            ps, pe = (i - 1) * B, i * B
+            p, b = _bpa_select_block(e[g, ps:pe], e, cands, ps, pe)
+            if p >= 0:
+                e[g, s:t] = z[g, s:t] + ((b * e[p, s:t]) >> BP_SHIFT)
+    return e
+
+
+def xpost_encode(x, cols=16):
+    x = np.asarray(x, np.int64)
+    C, N = x.shape
+    e = ec.lms_forward(x, order=XPOST_ORDER)   # TEMPORAL FIRST, on the RAW channels
+    z = _xpost_forward(e, cols)                # THEN the spatial subtract, on innovations
+    body = b"".join(ec.rice_encode_1d(z[c]) for c in range(C))
+    hdr = struct.pack("<HHII", XPOST_MAGIC, cols, C, N)   # NO side-info
+    return hdr + body
+
+
+def xpost_decode(buf):
+    magic, cols, C, N = struct.unpack_from("<HHII", buf, 0)
+    assert magic == XPOST_MAGIC, "bad xchan_post codec magic"
+    off = 12
+    z = np.empty((C, N), np.int64)
+    for c in range(C):
+        arr, off = ec.rice_decode_1d(buf, off)
+        z[c] = arr
+    e = _xpost_inverse(z, cols)                # undo the innovation-domain subtract
+    x = ec.lms_inverse(e, order=XPOST_ORDER)   # matched order-4 temporal inverse
+    return x.astype(np.int16)
+
+
+# ===========================================================================
 # Uniform codec objects + the registry
 # ===========================================================================
 class Codec:
@@ -3113,6 +3670,236 @@ _register(Codec("LMS4+Rice+xchan_jointbp2", jbp2_encode, jbp2_decode, CodecMeta(
     block_size=JBP2_BLOCK, notes=_JBP2_NOTE), family="cross-channel",
     desc="order-4 LMS + backward-adaptive per-block best-PAIR selection + joint "
          "co-adaptive 2-tap sign-sign LMS spatial predictor (zero side-info) + Rice"))
+
+# NEW candidate (this cycle): lag-matched (SPATIOTEMPORAL) cross-channel partner.
+# Ops accounting for the coarse->fine subsampled lag search, per sample-channel,
+# amortised over the LAGP_BLOCK=256 re-selection block. Reference point: the
+# backward-adaptive best-partner scan (_LMS4BPA_SELECT = 10) covers 5 scored
+# options (<=4 candidates + the no-partner option) at full rate, i.e. ~2.5
+# ops/sample-ch per scored option (2 running dot-product macs <x_c,x_p^tau> and
+# <x_p^tau,x_p^tau> + the residual/Rice-bits estimate). Here:
+#   stage 1 (coarse): 4 parents x 7 coarse lags = 28 options scored on a stride-2
+#                     DECIMATED block -> 28 x 2.5 x 0.5             = 35
+#   stage 2 (fine):   3 lags (tau-1/tau/tau+1) at full rate         =  7.5
+#   no-partner option at full rate                                  =  2.5
+#   per-block argmin over the coarse grid + commit, amortised       =  1
+# -> ~46 ops/sample-ch, on top of the rank-1 subtract itself (_XCHAN_OPS, now a
+# delay-line read instead of a same-sample read -- same cost) and the order-4
+# LMS+Rice back-end (_LMS4_OPS). That is 75 ops ~ 90 cyc/sample-ch, which still
+# clears the tight 125 cyc neural budget -- the subsampled coarse->fine search is
+# exactly what buys that (a flat 4 x 15-lag full-rate scan would not fit).
+# Backward-adaptive: the decoder RECOMPUTES the identical (partner, lag, beta)
+# from bit-identical reconstructed history, so dec_ops == enc_ops and ZERO bits
+# are transmitted. State/ch: order-4 LMS (_LMS4_STATE) + the 2*LAGP_MAX+1 = 15
+# int16 delay line (30 B) that lets ANY channel serve as a lagged parent + the
+# current (partner byte, int8 lag, int16 beta) = 4 B. Look-ahead is the bounded
+# LAGP_MAX = 7 samples the ENCODER needs for a negative (parent-leads) lag; the
+# decoder needs none (channel-sequential order fully reconstructs parent p<c
+# first), and a tau>=0-only variant would be strictly look-ahead-0.
+_LAGP_SELECT = 46
+_LAGP_STATE = _LMS4_STATE + 2 * (2 * LAGP_MAX + 1) + 4
+_LAGP_NOTE = (
+    "lag-matched (SPATIOTEMPORAL) cross-channel partner: the proven rank-1 "
+    "adaptive cross-channel subtract with its selection domain widened from "
+    "{partner} to {partner} x {integer time-lag}, chosen backward-adaptively per "
+    "block. Predicts y[c,t] = x[c,t] - ((beta*x[p,t-tau])>>s) instead of the "
+    "tau=0 form EVERY other front-end in this registry uses. WHY: INSIGHTS P1 "
+    "bounds the spatial gain by the real neighbour correlation, but every codec "
+    "here measures that mutual information at tau=0 ONLY. HD-sEMG is dominated by "
+    "motor-unit action potentials PROPAGATING along the fibre at 3-5 m/s, so the "
+    "inter-electrode cross-correlation peaks at tau* = IED/CV != 0 -- 8 mm (OTB "
+    "5x13) to 10 mm (Hyser 8x16) at 3-5 m/s = 1.6-3.3 ms = 3-7 samples at 2048 Hz, "
+    "roughly a 90-degree phase error at the dominant 80-120 Hz sEMG band. The "
+    "propagating component of the shared source is therefore structurally close to "
+    "invisible to a zero-lag subtract; aligning to the peak moves the residual "
+    "variance from (1-rho(0)^2) to (1-rho(tau*)^2), saving ~0.5*log2 of that ratio "
+    "bits/sample. This is a NEW slice of the cross-channel MI, not a re-slice of "
+    "the tau=0 family that cycles 10-15 showed landing within ~1% of a shared "
+    "ceiling. It is the same inter-electrode delay standard HD-sEMG "
+    "conduction-velocity estimation (Farina & Merletti) measures; no "
+    "paper-reported compression ratio is claimed. SELECTION (per channel, per "
+    "block i>0, backward, over the PREVIOUS already-reconstructed RAW block): "
+    "coarse->fine and subsampled to fit the embedded budget -- stage 1 scans the "
+    "<=4 causal grid neighbours (left/up/up-left/up-right, all idx<c, reused "
+    "_bp_candidates) over a stride-2 coarse lag grid (tau=-6,-4,..,+6) on a "
+    "stride-2 DECIMATED block (the lag is applied BEFORE decimation, so lag "
+    "resolution is preserved and only the correlation estimate uses half the "
+    "samples); stage 2 re-scores the winning cell's tau-1/tau/tau+1 at FULL rate "
+    "against the no-partner option and commits. Coarse scores are only compared "
+    "with coarse and fine with fine -- the two rates are never mixed. Gains are "
+    "the same integer least-squares beta (_bp_opt_beta) scored in the same "
+    "estimated Rice bits (_bp_score) as the promoted best-partner path. tau=0 is "
+    "on the grid, so the codec DEGENERATES GRACEFULLY to the proven zero-lag "
+    "rank-1 subtract wherever the lag buys nothing -- the expected outcome on "
+    "CapgMyo, whose differential array has already cancelled the shared "
+    "propagating mode (the honest negative control, consistent with P1, NOT a "
+    "failure). ZERO side-info, backward-adaptive (INSIGHTS P4): the decoder "
+    "recomputes the identical (partner, lag, beta) from bit-identical "
+    "reconstructed history. Block 0 bootstraps to no-partner. LOOK-AHEAD: a "
+    "SIGNED tau is required by the physics (the innervation zone sits mid-array, "
+    "so MUAPs propagate in BOTH directions and a causal neighbour can lead or lag "
+    "channel c); negative tau costs the ENCODER a bounded |tau|<=7 samples "
+    "(~3.4 ms) on the parent delay line, and the DECODER nothing at all, since "
+    "channel-sequential decoding fully reconstructs parent p<c before channel c. "
+    "A tau>=0-only variant is strictly look-ahead-0 at the cost of one "
+    "propagation direction. Back-end untouched: order-4 sign-sign LMS (P2) + "
+    "adaptive Rice (P5). Distinct from RETIRED iklt/iklt_adaptive (multi-tap "
+    "energy-preserving rotation corrupting both channels -> this stays rank-1, "
+    "residual-only, parent row left CLEAN, P3), RETIRED xchan_multiparent (summed "
+    "marginal parents double-count -> exactly ONE parent here), RETIRED "
+    "xchan_tans/xctx (entropy back-end levers -> coder untouched, P5), RETIRED "
+    "LMS4rs (predictor coefficient-set bank -> one order-4 predictor, P2). It is "
+    "xchan_bestpartner_adaptive with a lag axis added to the search.")
+_register(Codec("LMS4+Rice+xchan_lagpartner", lagp_encode, lagp_decode, CodecMeta(
+    integer_only=True, enc_ops=_LMS4_OPS + _XCHAN_OPS + _LAGP_SELECT,
+    dec_ops=_LMS4_OPS + _XCHAN_OPS + _LAGP_SELECT,
+    state_bytes_per_ch=_LAGP_STATE, causal=True, lookahead_samples=LAGP_MAX,
+    block_size=LAGP_BLOCK, notes=_LAGP_NOTE), family="cross-channel",
+    desc="order-4 LMS + backward-adaptive per-block (partner, TIME-LAG) rank-1 "
+         "cross-channel subtract, coarse->fine subsampled lag search (zero "
+         "side-info) + Rice"))
+
+# NEW candidate (this cycle): MDL-penalized spatial model-order selection.
+# The op/state profile is IDENTICAL to xchan_jointbp2 by construction -- same
+# candidate set, same fits, same joint 2-tap transform, same order-4 LMS + Rice
+# back-end. The criterion change costs ONE integer add per scored option (the
+# penalty itself is two constants, log2(B) via a bit_length, computed once per
+# block and amortised to ~0), so the selection scan goes _JBP2_SELECT -> +1.
+# State/ch is unchanged: order-4 LMS weights/history + the two int16 spatial taps
+# + the current selected (pu,pl) ids. Backward-adaptive: the decoder re-runs the
+# identical penalized selection from bit-identical reconstructed history ->
+# dec_ops == enc_ops, ZERO side-info, look-ahead 0 (INSIGHTS P4).
+_MDLSEL_SELECT = _JBP2_SELECT + 1
+_MDLSEL_STATE = _JBP2_STATE
+_MDLSEL_NOTE = (
+    "MDL-penalized spatial MODEL-ORDER selection: fixes a diagnosed ESTIMATOR "
+    "defect in the active xchan_jointbp2 rather than tuning a parameter of it. "
+    "DEFECT: _jbp2_select_block scores none / single-parent / joint-pair with "
+    "_bp_score on a least-squares fit computed over the SAME previous block it is "
+    "then scored on. The 2-parameter joint pair CONTAINS the 1-parameter single "
+    "(beta_q=0), so its in-sample residual can never be larger -- model-order "
+    "selection with no complexity term provably over-selects. That is the observed "
+    "signature (experiments/012): jointbp2 wins the diffuse large array (Hyser, "
+    "real second-parent MI, P1b) but regresses on tight OTB where P1b says the "
+    "local MI is essentially rank-1 and the second tap buys only ESTIMATION "
+    "VARIANCE -- invisible in-sample, paid as extra coded bits on the NEXT block, "
+    "which is the block the selection is used for. FIX (MDL/BIC, Rissanen/Schwarz): "
+    "the description length of a model class includes its parameter code length, so "
+    "each option is scored as (estimated Rice bits + (k/2)*log2(B)) with k = number "
+    "of SPATIAL TAPS (0 none / 1 single / 2 joint pair) and B the scored block "
+    "length; computed exactly in integers as (k*(B.bit_length()-1))//2 -- on B=256 "
+    "that is 0/4/8 bits, ONE integer add per scored option (_mdl_penalty). A second "
+    "tap must now out-earn its own description length before it is selected, so the "
+    "spatial order falls out of the DATA per channel AND per block at zero "
+    "side-info. Strictly better realization of INSIGHTS frontier #1 than a "
+    "channel-count gate: a geometry heuristic cannot separate CapgMyo (128 ch, "
+    "neighbour |corr| 0.29, wants no second parent) from Hyser (128 ch, high corr, "
+    "wants one) -- both are C=128, so the gate has no signal while the per-block "
+    "criterion does. EVERYTHING ELSE IS jointbp2 VERBATIM: same <=4 causal grid "
+    "neighbour candidates (_bp_candidates), same marginal integer-LS single fit "
+    "(_bp_opt_beta) and same JOINT 2x2 integer-LS pair fit (_jbp2_pair_resid, which "
+    "accounts for parent-parent covariance so it cannot double-count the shared "
+    "mode the RETIRED summed multiparent did); same transform -- ONE joint "
+    "co-adaptive 2-tap sign-sign LMS on the selected parents, pred=(w_u*x[pu]+"
+    "w_l*x[pl])>>shift, both taps descending the SHARED residual (+/-1 updates, "
+    "multiplierless), taps PERSISTING across blocks, ASYMMETRIC rank-1 "
+    "residual-only injection with the raw parent rows left CLEAN (P3); same block-0 "
+    "fixed (up,left) bootstrap; same order-4 sign-sign LMS temporal predictor (P2) "
+    "and adaptive Rice back-end (P5). The ONLY difference is the selection "
+    "criterion, so a measured delta is attributable to it alone. GUARD (P5): the "
+    "penalty gates the TRANSFORM order ONLY -- the Rice coder and its k are "
+    "untouched; modelling the Rice parameter is the RETIRED xctx lever and this is "
+    "not that. ZERO side-info, look-ahead 0, backward-adaptive (P4): the decoder "
+    "re-runs the identical penalized selection from bit-identical reconstructed "
+    "history (all candidate parents idx<c fully reconstructed first). Basis: "
+    "Rissanen MDL / Schwarz BIC order selection (textbook); no paper-reported "
+    "compression ratio claimed.")
+_register(Codec("LMS4+Rice+xchan_mdlsel", mdlsel_encode, mdlsel_decode, CodecMeta(
+    integer_only=True, enc_ops=_LMS4_OPS + _XJ2_XTRA + _MDLSEL_SELECT,
+    dec_ops=_LMS4_OPS + _XJ2_XTRA + _MDLSEL_SELECT,
+    state_bytes_per_ch=_MDLSEL_STATE, causal=True, lookahead_samples=0,
+    block_size=MDL_BLOCK, notes=_MDLSEL_NOTE), family="cross-channel",
+    desc="order-4 LMS + backward-adaptive per-block spatial model-ORDER selection "
+         "under an MDL/BIC parameter penalty (none/single/joint-pair) + joint "
+         "co-adaptive 2-tap sign-sign LMS (zero side-info) + Rice"))
+
+# NEW candidate (this cycle): innovation-domain cross-channel subtract -- the
+# CASCADE REORDER. Cost is IDENTICAL to LMS4+Rice+xchan_bestpartner_adaptive by
+# construction: the same order-4 LMS (_LMS4_OPS), the same rank-1 subtract
+# (_XCHAN_OPS: 1 mul + 1 shift + 1 sub per sample-ch, now reading the parent's
+# innovation instead of its raw sample -- same cost), and the same <=5-option
+# backward scan amortised over the re-selection block (_LMS4BPA_SELECT). Only the
+# ORDER of the two stages changed, plus a 4x longer re-selection block, which does
+# NOT change the scan rate (B previous samples scanned per B current samples) --
+# so ops/sample-ch and per-channel state are unchanged and the cost lands on the
+# promoted best's ~0.039. State/ch: order-4 LMS weights/history + the current
+# (partner byte, int16 beta) = _LMS4BPA_STATE. Backward-adaptive: the decoder
+# recomputes the identical (partner, beta) from bit-identical reconstructed
+# innovations -> dec_ops == enc_ops, ZERO side-info, look-ahead 0 (INSIGHTS P4).
+_XPOST_STATE = _LMS4BPA_STATE          # order-4 LMS + current (partner, beta)
+_XPOST_NOTE = (
+    "INNOVATION-DOMAIN cross-channel subtract -- a CASCADE REORDER, not a new "
+    "primitive. Every other cross-channel codec here runs spatial-first then "
+    "ec.lms_forward; this one runs the order-4 sign-sign LMS FIRST per channel on "
+    "the RAW signal and applies the proven rank-1 backward-adaptive subtract to the "
+    "resulting INNOVATION (whitened residual) sequences: e=lms4(x); z[c,blk i]="
+    "e[c,blk i]-((beta*e[p,blk i])>>shift), with (p,beta) re-selected per block from "
+    "the PREVIOUS block of the INNOVATIONS by the IDENTICAL estimator the promoted "
+    "best-partner path uses (_bp_candidates <=4 causal grid neighbours all idx<c, "
+    "_bp_opt_beta integer least-squares gain, _bp_score Rice-bits scoring, "
+    "no-partner option included -- _bpa_select_block reused VERBATIM, fed e instead "
+    "of x). WHY IT SHOULD CODE FEWER BITS: (i) stagewise objective mismatch -- the "
+    "spatial stage today minimizes RAW residual power, but the quantity actually "
+    "coded is the residual AFTER temporal whitening; the entropy-minimizing weight "
+    "is the ratio of INNOVATION cross-spectra, which is not the raw-domain beta "
+    "unless both channels share one whitening filter and the cross-spectrum is "
+    "flat, so the innovation-domain subtract makes the greedy stage minimize the "
+    "objective the coder actually pays for. (ii) The mixture is harder to whiten -- "
+    "x[c]-beta*x[p] mixes two AR processes and a sum of AR(p) is ARMA of higher "
+    "order than either, so the FIXED order-4 whitener INSIGHTS P2 mandates "
+    "systematically under-fits the signal the current cascade hands it; "
+    "temporal-first never creates that mixture (each predictor sees one un-mixed "
+    "channel, and the spatial stage then acts on already-white sequences). RISK to "
+    "MEASURE: innovations are near-white and low-amplitude, so the spatial estimator "
+    "sees a lower-SNR gradient and may adapt noisily -- mitigated by a LONGER "
+    "spatial adaptation time-constant (XPOST_BLOCK = 4 x ec.BLOCK = 1024 samples; "
+    "the Rice back-end keeps its own 256-sample k blocks), which is cost-neutral "
+    "because the backward scan still touches B previous samples per B current ones. "
+    "MATCHED PAIR / ZERO SIDE-INFO: the decoder Rice-decodes z, ascends channels "
+    "(every candidate partner has idx<g so e[p] is fully restored first) and ascends "
+    "blocks within a channel (block i-1 restored before block i), recomputing the "
+    "SAME (partner,beta) from bit-identical data, then one matched order-4 "
+    "ec.lms_inverse recovers x -- nothing transmitted, look-ahead 0, block 0 "
+    "bootstraps to no-partner. Stays ASYMMETRIC rank-1 (INSIGHTS P3): estimation "
+    "noise enters only channel g's coded residual, the parent's innovation row is "
+    "left CLEAN -- NOT the retired multi-tap/energy-preserving iklt rotation and NOT "
+    "the retired summed multiparent. Predictor order/form, candidate neighbourhood, "
+    "integer-LS beta, Rice-bits criterion and the adaptive Rice back-end (P5) are all "
+    "held FIXED, so a measured delta against LMS4+Rice+xchan_bestpartner_adaptive "
+    "(the same estimator in the RAW domain) is attributable to the cascade ORDER "
+    "alone. Basis: the innovations-domain formulation of multichannel prediction "
+    "(whiten-then-decorrelate, cf. Gray's asymptotic-equivalence argument for "
+    "prediction-error filters); no paper-reported ratio claimed on HD-sEMG.")
+_register(Codec("LMS4+Rice+xchan_post", xpost_encode, xpost_decode, CodecMeta(
+    integer_only=True, enc_ops=_LMS4_OPS + _XCHAN_OPS + _LMS4BPA_SELECT,
+    dec_ops=_LMS4_OPS + _XCHAN_OPS + _LMS4BPA_SELECT,
+    state_bytes_per_ch=_XPOST_STATE, causal=True, lookahead_samples=0,
+    block_size=XPOST_BLOCK, notes=_XPOST_NOTE), family="cross-channel",
+    retired=True,
+    retired_reason="Conclusively Pareto-dominated by LMS4+Rice+xchan_bestpartner_adaptive "
+                   "(the SAME estimator in the RAW domain) at IDENTICAL cost 0.03874263375, "
+                   "identical state 27 B/ch and identical look-ahead 0: strictly worse ratio "
+                   "on ALL 4 real sets (hyser 1.4612 vs 1.4770, otb 2.0801 vs 2.1531, capgmyo "
+                   "1.3479 vs 1.3529, cemhsey 1.9291 vs 1.9539) -- no axis on which it is "
+                   "better, so it holds no Pareto corner. At MATCHED 256-sample spatial block "
+                   "the reorder alone still loses (-0.57% hyser, -2.58% otb); whitening first "
+                   "strips the lowpass band that carries the inter-channel coherence, so the "
+                   "innovation-domain subtract recovers only 73-89% of the raw-domain "
+                   "cross-channel gain. Cascade-order lever spent NEGATIVE. See "
+                   "experiments/017_lms4_rice_xchan_post.md.",
+    desc="order-4 LMS FIRST, then backward-adaptive per-block best-of-4 rank-1 "
+         "cross-channel subtract in the INNOVATION domain (cascade reorder, zero "
+         "side-info) + Rice"))
 
 
 def list_codecs(include_retired=False):

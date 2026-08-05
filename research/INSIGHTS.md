@@ -30,6 +30,9 @@ LZMA (1.67× Hyser) is ahead and isn't portable. If the offline best-partner
 *selection* is unacceptable on-node, port `LMS4+Rice+xchan_bestpartner_adaptive`
 (re-selects per block, zero side-info, ratio within ~0.4%).
 
+_Unchanged through cycle 16 (2026-08-05): none of `xchan_lagpartner`, `xchan_mdlsel`,
+`xchan_post` beat it on real data (P1c, P1d, P6 below). Best embeddable since cycle 7._
+
 ## Established principles (proven on real HD-sEMG)
 
 ### P1 — Cross-channel spatial decorrelation is the dominant lever, bounded by real neighbour correlation.
@@ -49,6 +52,31 @@ LZMA (1.67× Hyser) is ahead and isn't portable. If the offline best-partner
   Match the spatial basis to the redundancy's scale. A **decoder-observable channel
   count** cleanly gates which basis to use with zero side-info (`acar_sel`).
 
+### P1c — The neighbour MI is INSTANTANEOUS: it is fully measured at lag 0. There is no propagation-delay slice to recover.
+- **Evidence (cycle 16, `xchan_lagpartner`, real):** widening the selection domain from
+  `{partner}` to `{partner}×{lag}`, τ ∈ [−7, +7], and instrumenting the selector over
+  every (channel, block): τ = 0 is chosen in **97.3%** of hyser and **97.6%** of cemhsey
+  blocks, and **\|τ\| ≥ 3 in ≤ 8.3%** of blocks on *any* real set — the non-zero mass is
+  overwhelmingly ±1 (83% of otb's, 72% of capgmyo's non-zero selections). Ratio:
+  hyser 1.4762 (−0.06% vs the zero-lag sibling), otb 2.0559 (**−4.51%**), cemhsey 1.9534
+  (−0.03%), capgmyo **1.3575 (+0.34%, the highest capgmyo ratio of any codec or reference)**.
+- **Theory:** the predicted `τ* = IED/CV ≈ 3–7 samples @2048 Hz` slice assumes the shared
+  component *travels*. It does not: the dominant shared component between surface
+  electrodes is the **quasi-static volume-conducted field**, which reaches neighbours with
+  no delay, while the travelling depolarization zone carries only a small fraction of the
+  shared power at 8–10 mm spacing. So `ρ(τ)` peaks at τ = 0 and P1's zero-lag bound is not
+  a measurement artefact — it is the physics. Second, a widened search **costs**: the
+  candidate set grows 5 → 29, and the argmin of an *in-sample* score over ~6× more options
+  suffers a winner's curse. Crucially, lag is the **least stationary** parameter — a
+  phase/delay has a coherence time shorter than the 125 ms selection block, so a τ chosen
+  from block *i−1* is stale for block *i* and a misaligned subtract *raises* residual variance.
+- **Implication:** τ = 0 is not a limitation to route around; the spatial lever is exhausted
+  at zero lag on **monopolar** arrays. The single exception is a **differential/bipolar**
+  array (CapgMyo), where the derivation has already cancelled the instantaneous mode
+  (\|corr\|(0) ≈ 0.29) so the propagating remainder is all that is left — there a ±1-sample
+  lag is the *only* MI available and it pays (+0.35 pp of achieved cross-channel gain,
+  1.44% → 1.79%). Gate any lag search on low ρ(0), and keep it to τ ∈ {−1, 0, +1}.
+
 ### P1b — A JOINT 2-parent solve recovers a second parent's MI, but selection and count are substitutes set by geometry.
 - **Evidence:** a joint co-adaptive 2-tap sign-LMS on both parents got the **highest
   Hyser cross-channel gain of any codec (+12.55%, `jointbp2`)** — the second parent
@@ -64,6 +92,26 @@ LZMA (1.67× Hyser) is ahead and isn't portable. If the offline best-partner
 - **Implication:** per-scale winner is settled — **single selected partner on tight
   arrays, jointly-solved best-pair on large arrays.** No single *fixed* front-end wins
   both; a *scale-selected* one is the open lever (frontier #1).
+
+### P1d — The spatial model-order selection surface is FLAT: fixing the selector's bias changes the choice a lot and the bits not at all.
+- **Evidence (cycle 16, `xchan_mdlsel`, real):** adding the exact MDL/BIC parameter code
+  length `(k/2)·log₂B` to `jointbp2`'s in-sample criterion **changed the selected spatial
+  order on 7.3% (hyser) / 8.6% (otb) / 25.8% (capgmyo) / 24.2% (cemhsey) of channel-blocks**,
+  cutting the k = 2 share by 7–24 pp (cemhsey 64.3% → 40.3%) — the diagnosed over-selection
+  bias is real and the correction is large. Ratio moved by **≤ 0.025% in either direction**
+  (hyser 1.496743 vs 1.496924, cemhsey 1.952733 vs 1.952260). On the flipped blocks the
+  *unpenalized* in-sample gap between the two candidate orders is a **median of 3.0 bits per
+  256-sample block — 0.09–0.10% of that block's ~3030 coded bits**.
+- **Theory:** the in-sample bias was a **labeling** bias, not a **coding** bias. When the
+  second parent carries little MI the joint 2×2 integer LS shrinks its tap toward zero and
+  the fixed-point β grid rounds it to exactly 0, so a k = 2 *selection* degenerates to the
+  k = 1 *transform* in the emitted stream. What is left is below the **rate granularity of
+  the entropy back-end**: Golomb-Rice moves in ~1 bit/sample steps of *k* and cannot spend a
+  3-bits-per-block difference. This is P5's floor argument mirrored onto model selection.
+- **Implication:** a **visibility bar** for every future front-end refinement — a mechanism
+  must change the residual by **≳ 0.1 bit/sample (~25 bits per 256-sample block)** to survive
+  the coder that has to express it. Do not spend a cycle on estimator/criterion polish inside
+  the existing candidate set; only a mechanism that opens a *new* MI slice can clear the bar.
 
 ### P2 — Temporal prediction saturates early; deeper prediction *hurts* on real data.
 - **Evidence:** order-4 LMS beats order-8 on Hyser and OTB across three independent
@@ -104,6 +152,15 @@ LZMA (1.67× Hyser) is ahead and isn't portable. If the offline best-partner
 - **Implication:** prefer backward-adaptive estimation. Treat any offline/whole-signal
   parameter as a realization gap, not a real on-node result — and confirm the streaming
   form's ratio before quoting it as embeddable.
+- **Refinement (cycle 16, real): "slowly varying" has a measurable limit — shorter blocks win,
+  and a *phase* parameter is not slowly varying at all.** Lengthening the spatial re-selection
+  block 256 → 1024 samples costs ratio in **both** cascade domains (raw: hyser −0.47%,
+  otb −0.76%, cemhsey −0.56%; innovation: −0.50%, −0.83%, −0.60%), so `(partner, β)` are
+  non-stationary at the ~125 ms scale and *more frequent* re-selection is strictly better —
+  a longer time constant is not a safe way to buy estimator stability. And per P1c a delay/lag
+  parameter's coherence time is *shorter* than one block, so backward selection of it injects
+  noise rather than tracking a slow drift. **Backward adaptation is free only for parameters
+  whose coherence time exceeds the block; check that before widening a selection domain.**
 
 ### P5 — Golomb-Rice is at the entropy floor; the entropy back-end is NOT a lever here.
 - **Evidence:** a LOCO-ANS-style tANS coder on the identical predictor was **1.4–1.8%
@@ -118,25 +175,65 @@ LZMA (1.67× Hyser) is ahead and isn't portable. If the offline best-partner
   **spent, dead lever for ratio**. Lower residual entropy upstream (better decorrelation),
   never at the coder. A back-end swap is justifiable only for throughput/hardware, never ratio.
 
+### P6 — Cascade order is settled: SPATIAL first, then temporal. Whitening first destroys the band that carries the neighbour MI.
+- **Evidence (cycle 16, `xchan_post`, real):** the same rank-1 estimator moved into the
+  *innovation* domain (order-4 LMS first, then the subtract) loses on **all four** real sets
+  at **identical** cost 0.03874 — hyser 1.4612 (−1.07% vs its raw-domain twin), otb 2.0801
+  (−3.39%), capgmyo 1.3479 (−0.37%), cemhsey 1.9291 (−1.27%) — and retains only **74–89%**
+  of the raw-domain achieved cross-channel gain (otb +13.37% vs +17.35%). Confound removed:
+  at a matched 256-sample spatial block the reorder alone still loses −0.57% (hyser) /
+  −2.58% (otb) / −0.21% (capgmyo) / −0.68% (cemhsey). **Retired.**
+- **Theory:** for a fixed β and one shared filter the stages *commute*
+  (`A(x_c − βx_p) = A x_c − β·A x_p`), so there was no first-order gain on offer; what breaks
+  the commutation is that the LMS whitener is **per-channel adaptive** (`A_c ≠ A_p`), and the
+  asymmetry favours spatial-first for two reasons. (i) Subtract first and the temporal
+  predictor adapts to *exactly the sequence that is coded*; whiten first and the spatial stage
+  is handed two signals already whitened by *different* filters, each having partially removed
+  the shared component. (ii) Volume-conducted common mode is **lowpass and high-power** —
+  precisely the band the whitener flattens — so `ρ(innovations) < ρ(raw)`. The deficit is
+  largest on the highest-coherence array (OTB), the signature of a coherence loss rather than
+  an adaptation artefact.
+- **Also refuted:** the "difference of two AR processes is higher-order ARMA, so order-4
+  under-fits the mixture" argument predicts spatial-first should be *harder* to whiten. It is
+  measurably *easier to code*, on all four real sets — consistent with P2 (near-white after
+  order 4 either way).
+- **Implication:** never reorder the cascade. Any new spatial mechanism goes **before** the
+  temporal predictor, on the raw channels.
+
 ---
 
 ## Open frontier (ranked by expected payoff/cost)
 
-1. **Scale-select the spatial front-end between the two proven per-scale winners**
-   (P1b): single *selected* best-partner for `C≤64`, jointly-solved best-*pair* for
-   `C≥128`, gated by the decoder-observable channel count (the zero-side-info gate proven
-   by `acar_sel`). Both branches and the gate are already verified; this is the first
-   construction that could clear the best on the primary Hyser *and* hold the tight-array
-   OTB corner. **Highest payoff, lowest mechanism risk.** Risk: the large-array win is only
-   +1.12% at higher cost — measure the full 4-set profile before claiming a promotion.
-2. **Change the predictor's FUNCTIONAL FORM, not its coefficient count** (P2/P5). A
-   linear LMS residual is white *to second order*; any remaining compressibility is
-   higher-order. A small sign-of-neighbour or gated-magnitude nonlinearity (still order
-   ≤4) is the only live temporal lever. Medium payoff, genuinely different axis, higher risk.
-   Pursue only if #1 doesn't clear the best.
-3. **Guarantee #1's large-array branch streams** (P4): confirm its per-block pair
-   re-selection holds the offline ratio (à la `bestpartner_adaptive`). An embeddability
-   guarantee, not a ratio play.
+_Refreshed after cycle 16. Three levers were spent this cycle: the **lag/spatiotemporal**
+axis (P1c, spent — τ = 0 is the physics), the **selection-criterion / estimator fix**
+(P1d, spent — the surface is flat), and the **cascade reorder** (P6, spent NEGATIVE,
+retired). The previous #3 (guarantee the large-array branch streams) is **already
+satisfied**: `jointbp2`/`mdlsel` are backward-adaptive, zero-side-info, look-ahead 0._
+
+1. **Compose the two measured per-set maxima under the proven zero-side-info scale gate**
+   (P1b + P1): `C ≤ 64` → the `acar_sel` CAR-then-best-partner cascade (otb **2.1795**,
+   the measured tight-array max), `C ≥ 128` → the jointly-solved best-pair `jointbp2`
+   (hyser **1.4969**, the measured large-array max). Every cell is already measured on real
+   data, so the projected profile is hyser +1.12%, otb +0.81%, capgmyo −0.01%, cemhsey −0.17%
+   vs the current best — **the first construction that clears the best on the primary Hyser
+   AND the tight-array OTB simultaneously**, and the first 4-set improvement candidate since
+   cycle 7. Both branches and the gate are already verified ⇒ **highest payoff, lowest
+   mechanism risk**; cost ≈0.051. Risk: cemhsey stays −0.17% below `bestpartner` (a
+   large-array corner the joint pair does not win) — decide in advance whether that is
+   acceptable for a promotion, or add a third branch keyed on the same observable.
+2. **Narrow-lag partner, τ ∈ {−1, 0, +1}, gated on low ρ(0)** (P1c). The one *positive*
+   real-data finding of the lag axis was on the differential array (capgmyo +0.34% over the
+   zero-lag sibling, a new max), and ±1 accounts for 72–83% of all non-zero lag selections
+   while \|τ\| ≥ 3 is ≤8.3%. Cutting the domain from 29 options to 13 removes most of the
+   winner's-curse loss that sank OTB (−4.51%) and drops cost from 0.0775 toward ~0.045.
+   Medium payoff (capgmyo is the negative control, so it cannot move the headline), low risk,
+   cheap. Do **not** re-open wide-τ search.
+3. **Change the predictor's FUNCTIONAL FORM, not its coefficient count** (P2/P5) — now the
+   only untouched axis. A linear LMS residual is white *to second order*; any remaining
+   compressibility is higher-order. A small sign-of-neighbour or gated-magnitude nonlinearity
+   (still order ≤4) is the live temporal lever. **New bar from P1d: it must move the residual
+   by ≳0.1 bit/sample (~25 bits per 256-sample block) or it will be invisible to the Rice
+   back-end.** Highest mechanism risk; pursue if #1 does not clear the best.
 
 ## Dead ends — do NOT re-propose (a genuinely different variant must say why)
 
@@ -151,6 +248,21 @@ LZMA (1.67× Hyser) is ahead and isn't portable. If the offline best-partner
 - **Always-on global CAR cascade** (`acar+bestpartner`): superseded by its *scale-gated*
   form `acar_sel` (same tight-array corner, no large-array regression) — always gate a
   geometry-dependent lever on a decoder-observable variable (P1).
+- **Innovation-domain / temporal-first cascade** (`xchan_post`, **retired** cycle 16):
+  whitening first flattens the lowpass band that carries the volume-conducted neighbour
+  coherence, so `ρ(innovations) < ρ(raw)` and the subtract recovers only 74–89% of the gain;
+  it also denies the temporal predictor the chance to adapt to the sequence actually coded.
+  Dominated at *identical* cost on all 4 real sets (P6). **Spatial always goes first.**
+- **Wide integer-lag ("spatiotemporal") partner search** (`xchan_lagpartner`, codec kept
+  registered as the non-dominated max-CapgMyo corner — the **lever** is spent): the shared
+  field is quasi-static, so ρ(τ) peaks at τ = 0 and a widened selection domain buys winner's
+  curse on a parameter whose coherence time is shorter than the block (P1c/P4). Only a
+  **τ ∈ {−1,0,+1}** form, gated on low ρ(0), is still worth trying.
+- **Polishing the spatial selection criterion inside the existing candidate set**
+  (`xchan_mdlsel`, codec kept registered — the **lever** is spent): MDL/BIC penalization
+  changes 7–26% of the selected orders and ≤0.025% of the bits, because the selection surface
+  is flat at ~3 bits per 256-sample block, below the Rice back-end's rate granularity (P1d).
+  Do not re-propose held-out/cross-validated scoring of the same options either.
 
 ## Sanity anchors
 - Real embeddable ratios on HD-sEMG live in **~1.3–2.2×**. Any lossless ratio **> ~6×** on
