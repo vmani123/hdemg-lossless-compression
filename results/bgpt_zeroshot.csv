@@ -1,0 +1,13 @@
+dataset,bits,model,bits_per_sample,ratio,chunks
+otb_hdsemg_vl,16,delta+Rice,8.0743,1.9816,
+otb_hdsemg_vl,16,LMS+Rice,8.0519,1.9871,
+otb_hdsemg_vl,16,LMS4+Rice+xchan_bestpartner,6.6630,2.4013,
+otb_hdsemg_vl,16,bgpt_audio_110M_zeroshot,14.8696,1.0760,64
+hyser_1dof_f1_s1,16,delta+Rice,11.9917,1.3343,
+hyser_1dof_f1_s1,16,LMS+Rice,11.9207,1.3422,
+hyser_1dof_f1_s1,16,LMS4+Rice+xchan_bestpartner,10.7366,1.4902,
+hyser_1dof_f1_s1,16,bgpt_audio_110M_zeroshot,14.9545,1.0699,128
+otb_hdsemg_vl,8,delta+Rice,5.4311,1.4730,
+otb_hdsemg_vl,8,LMS+Rice,6.0181,1.3293,
+otb_hdsemg_vl,8,LMS4+Rice+xchan_bestpartner,4.2144,1.8983,
+otb_hdsemg_vl,8,bgpt_audio_110M_zeroshot,5.2391,1.5270,64

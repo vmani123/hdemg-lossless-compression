@@ -88,8 +88,14 @@ LZMA (1.67× Hyser) is ahead and isn't portable. If the offline best-partner
   attention, depth, and long context buys ~nothing, because after a low-order predictor the HD-sEMG
   residual is near-white sensor noise no model can predict. **Nonlinearity — and long-range temporal
   structure — are not accessible levers on the temporal axis** (strong confirmation of P2); the
-  ceiling is **data-limited, not model-limited**, so the paper's untested 110M scale is very unlikely
-  to move it (and is ill-posed here: no HD-sEMG pretraining corpus; domain mismatch). **One exception,
+  ceiling is **data-limited, not model-limited**. **Confirmed against the ACTUAL paper model (017):**
+  the real 110M **bGPT-audio** (LMCompress's audio net, pretrained on LibriSpeech) run zero-shot gets
+  only **~1.07× on 16-bit lossless** — worse than `delta+Rice` (16-bit bytes are OOD for an 8-bit
+  audio model); in its native 8-bit format (lossy) it beats temporal-only `LMS+Rice` by +14.9 % but
+  **still loses to the cross-channel champion** because it is mono. So a *domain-matched* small model
+  only ties us and the *actual* (domain-mismatched, mono) paper model is worse: **scale is not the
+  missing ingredient — cross-channel structure and embeddability are** (and a domain-matched large
+  model is ill-posed here: no HD-sEMG pretraining corpus). **One exception,
   and it is spatial:** on CapgMyo (neighbour |corr|≈0.29) both learned models find a **nonlinear
   cross-channel** gain the rank-1 linear best-partner misses (+1.4/+1.9 % over champion; the MLP
   ~doubles the linear +1.8 % xchan gain). Even that is idealised and non-embeddable (~470 k params +
