@@ -27,6 +27,8 @@ The top-level [`../README.md`](../README.md) is the front door; start there.
 | `lm_probe.py` | **learned-model headroom probe** (LMCompress-style): MLP → discretised-logistic NLL = ideal code length, vs the real champion on a held-out tail; `--selftest` checks pmf + gradients. Measures a ceiling, ships no codec — see `experiments/015_*` |
 | `lm_probe_transformer.py` | same probe with a **causal Transformer** (attention, context 256, ~470 k params; needs `torch`) — confirms 015's ceiling is model-agnostic (two architectures agree to ~0.7 %). See `experiments/016_*` |
 | `bgpt_probe.py` | runs the **actual LMCompress audio model** (110M bGPT-audio) zero-shot on our EMG via `model.loss` = bits/byte; needs `torch`/`transformers`/`samplings` + the [bgpt](https://github.com/sanderwood/bgpt) repo + `weights-audio.pth`. Verdict: ~1.07× lossless (fails). See `experiments/017_*` |
+| `xchan_structure_probe.py` | **design diagnostic** (numpy): decomposes the cross-channel gain into nonlinear-*predictor* vs neighbour-energy-*scale* by residual entropy. Finding: the lever is **scale** (co-activation), not prediction. `experiments/018_*` |
+| `xscale_poc.py` | **real-Rice PoC** of the `+xscale` primitive (neighbour-energy-conditioned Rice-k, causal/integer/lossless): ~+0.8 % on CapgMyo, hurts high-corr arrays ⇒ must be geometry-gated. `experiments/018_*` |
 | `bootstrap.sh` | idempotent env setup for an ephemeral session |
 | `ROUTINE_PROMPT.md` | the scheduled-routine prompt that runs a committed cycle |
 

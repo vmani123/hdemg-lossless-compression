@@ -41,6 +41,17 @@ LZMA (1.67× Hyser) is ahead and isn't portable. If the offline best-partner
   neighbours, which grows with correlation. Where neighbour correlation is low, the
   achievable gain is small *by the physics*, not codec weakness. CapgMyo is the
   honest negative control.
+- **Refinement — on a differential array the residual cross-channel MI is in the VARIANCE, not the
+  mean (018).** Diagnosing the learned model's only real edge (CapgMyo): a nonlinear cross-channel
+  *predictor* recovers **nothing** (−0.07 bits), but conditioning the coding *scale* on the
+  concurrent neighbours' *energy* recovers **+0.318 bits/sample** (vs +0.09–0.11 on the high-corr
+  sets). Mechanism = **volume-conduction co-activation** — a motor-unit spike raises energy across
+  neighbouring electrodes at once, so on a differential array (low *signed* corr) the cross-channel
+  MI hides in the residual **variance**, invisible to a signed rank-1 subtract. Under a REAL causal
+  integer Rice-k rule this banks only ~**+0.8 % on CapgMyo** and *hurts* the high-corr arrays (their
+  own-EWMA already tracks scale) ⇒ a **geometry-gated scale mechanism** (`+xscale_sel`, like
+  `acar_sel`/P1b: ON for low-corr differential arrays only). So CapgMyo is a *smaller* dead end than
+  P1 implied — a real ~1 % lever lives there, in the scale. See `experiments/018_*`.
 - **Implication:** prioritize spatial mechanisms only where neighbour correlation is
   high. The cross-channel MI splits into **non-interchangeable slices set by array
   scale**: a **global common-mode (CAR)** dominates *tight* arrays (OTB 64-ch: array
