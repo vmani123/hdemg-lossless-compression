@@ -25,6 +25,7 @@ The top-level [`../README.md`](../README.md) is the front door; start there.
 | `bench.py` | per-codec × dataset benchmark → `../results/*.csv` |
 | `search.py` | hill-climb the design space subject to `embedded_ok`; ablations + Pareto front |
 | `lm_probe.py` | **learned-model headroom probe** (LMCompress-style): MLP → discretised-logistic NLL = ideal code length, vs the real champion on a held-out tail; `--selftest` checks pmf + gradients. Measures a ceiling, ships no codec — see `experiments/015_*` |
+| `lm_probe_transformer.py` | same probe with a **causal Transformer** (attention, context 256, ~470 k params; needs `torch`) — confirms 015's ceiling is model-agnostic (two architectures agree to ~0.7 %). See `experiments/016_*` |
 | `bootstrap.sh` | idempotent env setup for an ephemeral session |
 | `ROUTINE_PROMPT.md` | the scheduled-routine prompt that runs a committed cycle |
 

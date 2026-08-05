@@ -76,22 +76,27 @@ LZMA (1.67× Hyser) is ahead and isn't portable. If the offline best-partner
   regime bank, `LMS4rs`) is the same mistake as deeper order — it fragments adaptation
   and fits noise; **spent NEGATIVE, retired.** To lower temporal residual entropy the
   predictor's *functional form* must change (genuinely non-linear), not its tap/set count.
-- **Ceiling probe — the non-linear lever, MEASURED (015, 2026-08-03).** An LMCompress-style
-  learned front-end (`research/lm_probe.py`: an MLP → discretised-logistic **NLL = the ideal code
-  length**, so no arithmetic coder needed) was given the **same causal context** as the champion
-  (own past deltas + the concurrent best-neighbour + all channels' lagged delta). The idealised
-  nonlinear model **ties `LMS4+xchan_bp` within ±2 % on all four real sets** (Hyser −0.9 %, OTB
-  +1.0 %, CEMHSEY −2.0 %, CapgMyo +1.9 %). The paper's "halving" does **not** transfer: after a
-  low-order predictor the HD-sEMG residual is near-white sensor noise no model can predict, so
-  **nonlinearity is not an accessible lever on the temporal axis** — even a generous (idealised NLL,
-  within-recording-trained) model can't beat the linear codec. **One exception, and it is spatial:**
-  on CapgMyo (neighbour |corr|≈0.29) the nonlinear model **doubles** the linear best-partner's
-  cross-channel gain (+3.8 % vs +1.8 %) → the only redundancy a rank-1 linear subtract misses is
-  **nonlinear cross-channel on low-linear-correlation differential arrays.** Even that is ~2 %
-  idealised and costs ~190–800× the compute + float `exp`/`sigmoid` + bit-exact determinism ⇒
-  `embedded_ok = NO`. **Actionable lead (frontier):** a *cheap integer* nonlinear cross-channel term
-  (e.g. a sign/abs cross-product or a small LUT on the best-partner residual), **not** a neural net,
-  on differential arrays. Full record: `experiments/015_lm_probe_learned_ceiling.md`.
+- **Ceiling probe — the non-linear lever, MEASURED by TWO model classes (015 + 016, 2026-08-03).**
+  An LMCompress-style learned front-end (**NLL = the ideal code length**, so no arithmetic coder
+  needed) was given the **same causal context** as the champion (own past deltas + the concurrent
+  best-neighbour + all channels' lagged delta) and measured on all four real sets. It **ties
+  `LMS4+xchan_bp` within ±2 %** — and this was confirmed by **two independent architectures that
+  agree to ~0.7 %**: a tiny order-8 **MLP** (`research/lm_probe.py`, 015) and a **4-layer causal
+  Transformer** with 32× the temporal context and ~10× the params (`research/lm_probe_transformer.py`,
+  016). Per-set Δ vs champion: Hyser −0.9 %, OTB +1.0 %, CEMHSEY −1.2/−2.0 %, CapgMyo +1.4/+1.9 %.
+  The paper's "halving" does **not** transfer, and it is **not** a model-weakness artifact: adding
+  attention, depth, and long context buys ~nothing, because after a low-order predictor the HD-sEMG
+  residual is near-white sensor noise no model can predict. **Nonlinearity — and long-range temporal
+  structure — are not accessible levers on the temporal axis** (strong confirmation of P2); the
+  ceiling is **data-limited, not model-limited**, so the paper's untested 110M scale is very unlikely
+  to move it (and is ill-posed here: no HD-sEMG pretraining corpus; domain mismatch). **One exception,
+  and it is spatial:** on CapgMyo (neighbour |corr|≈0.29) both learned models find a **nonlinear
+  cross-channel** gain the rank-1 linear best-partner misses (+1.4/+1.9 % over champion; the MLP
+  ~doubles the linear +1.8 % xchan gain). Even that is idealised and non-embeddable (~470 k params +
+  attention, float transcendentals, bit-exact-determinism requirement ⇒ `embedded_ok = NO`).
+  **Actionable lead (frontier):** a *cheap integer* nonlinear cross-channel term (e.g. a sign/abs
+  cross-product or a small LUT on the best-partner residual), **not** a neural net, on differential
+  arrays. Full records: `experiments/015_lm_probe_learned_ceiling.md`, `experiments/016_lm_probe_transformer.md`.
 
 ### P3 — For the spatial transform, data-dependent beats data-independent; rank-1 adaptive beats multi-tap.
 - **Evidence:** a fixed 45° integer-KLT captured ~half the adaptive single-neighbour
