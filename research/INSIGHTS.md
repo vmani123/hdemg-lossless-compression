@@ -30,6 +30,12 @@ LZMA (1.67× Hyser) is ahead and isn't portable. If the offline best-partner
 *selection* is unacceptable on-node, port `LMS4+Rice+xchan_bestpartner_adaptive`
 (re-selects per block, zero side-info, ratio within ~0.4%).
 
+*Unchanged after cycle 2026-08-07 (3 candidates, 2 retired).* The highest per-set
+embeddable ratios now live on non-dominated corners rather than on the headline:
+Hyser `jointbp2` 1.4969× / `scalesel` 1.4943×, OTB `acar_sel+bestpartner` 2.1795×,
+CapgMyo `scalesel` 1.3525×, CEMHSEY `bestpartner` 1.9555×. No single codec holds all
+four — see P1c for why that is now believed to be a ceiling, not a gap.
+
 ## Established principles (proven on real HD-sEMG)
 
 ### P1 — Cross-channel spatial decorrelation is the dominant lever, bounded by real neighbour correlation.
@@ -63,7 +69,58 @@ LZMA (1.67× Hyser) is ahead and isn't portable. If the offline best-partner
   the extra jointly-solved parent finds real MI.
 - **Implication:** per-scale winner is settled — **single selected partner on tight
   arrays, jointly-solved best-pair on large arrays.** No single *fixed* front-end wins
-  both; a *scale-selected* one is the open lever (frontier #1).
+  both. A *scale-selected* one is now measured — see P1c.
+
+### P1c — The per-scale arbitration is SOLVABLE with zero side-info, but it is ratio-neutral: the spatial front-end has hit a shared MI ceiling.
+- **Evidence (`xchan_scalesel`, cost 0.0494):** a backward **rank-2-benefit gate**
+  (`B2 + B1/128 ≤ B1`, both estimated in Rice bits over the previous reconstructed block)
+  picks the right branch on both scales **without the codec ever seeing the channel
+  count**: Hyser 1.4943× = **+1.171% over its own rank-1 branch** (`bestpartner_adaptive`
+  1.4770×), OTB 2.1530× = **+0.036% over its own rank-2 branch** (`jointbp2` 2.1522×).
+  Best CapgMyo ratio of any registered codec (1.3525×). *But* it sits −0.004…−0.175%
+  **below the per-set max of its two branches on all four sets**, its 4-set mean is a
+  +0.044% tie with the best, and on CEMHSEY it falls −0.033% below **both** branches.
+- **Theory:** (a) a gate is a *selector over two estimators*; its achievable entropy is
+  `min` over branches **plus** the loss from choosing wrong on some blocks — it can never
+  exceed the better branch. (b) The within-recording per-channel rank split it hoped to
+  harvest is small because the **neighbourhood covariance rank is near-stationary within a
+  recording** (the P4 slowly-varying regime), so a whole-recording choice already captures
+  nearly all of it. (c) The CEMHSEY sub-min result exposes **selector/estimator coupling**:
+  the rank-2 joint taps must be *frozen* through rank-1 blocks for determinism, so each
+  switch resumes adaptation from a stale state and pays a re-convergence transient — a
+  "free" backward selector is not free when the branch it gates is itself adaptive.
+- **Implication:** the *choice* of spatial front-end is **not** where the remaining bits
+  are. Every LMS4 cross-channel codec now sits within **±1.1% on Hyser and ±0.5% on the
+  other three real sets** — that spread is a **shared spatial-MI ceiling**, not a mechanism
+  gap. Frontier #1 is **spent (resolved, ratio-neutral)**. Do not propose further
+  arbitration/gating among already-measured spatial front-ends; only a front-end that
+  reaches redundancy *none* of them addresses can move the number.
+
+### P1d — The spatial parent lives at LAG 0; widening the backward argmin costs selection variance, and that cost is paid where the MI margin is flattest.
+- **Evidence (`xchan_lagbp`, cost 0.0706):** adding a propagation-lag axis `d ∈ [0..8]` to the
+  proven per-block best-partner argmin (rank stays 1, back-end unchanged — the only variable is
+  the search grid) **lost on all 4 real sets vs. the identical lag-0 codec**
+  `bestpartner_adaptive`: otb 2.0923× vs 2.1531× (**−2.825%**), hyser 1.4767× vs 1.4770×,
+  capgmyo 1.3513× vs 1.3529× (**−0.113%**), cemhsey 1.9534× vs 1.9539×. Retired. The candidate's
+  own pre-registered falsification criterion — *"largest gain expected on CapgMyo"* — **fired**.
+  (A synthetic propagating-source probe confirms the machinery works and recovers true delays with
+  β ≈ 1.0, so this is a data fact, not a bug: mechanism-illustration only.)
+- **Theory, two layers.** (1) **The lag has nowhere to go.** At 1–2 kHz sampling with 4–10 mm
+  inter-electrode spacing and 3–5 m/s conduction velocity, the true inter-electrode delay is
+  **~0.5–2% of a sample period** — sub-sample. `I(x_g[t]; x_p[t−d])` peaks at `d = 0` and falls
+  monotonically for `d ≥ 1`; the delayed replica is *not resolvable on this sampling grid*.
+  CapgMyo, the slowest-sampled set (1 kHz), inverted the prediction hardest — exactly as this
+  predicts. (2) **A wider argmin over the same block is a worse estimator.** The option count grew
+  ~9× (4 partners → 36 `(p,d)` pairs) with the block length unchanged, so the argmin more often
+  picks the *winner by noise*, which is then applied to the **next** block where the noise does not
+  repeat — textbook selection overfitting / winner's curse. The loss scales **inversely with the MI
+  margin** between the true best option and its runners-up, which is why the tight, near-rank-1
+  64-ch OTB array (P1b) is hurt worst.
+- **Implication:** backward selection is cheap in *side-info* but not in *statistics* — **only widen
+  a backward option set when the added options carry MI comparable to the incumbent's margin**, and
+  budget the block length against the option count. The lag axis is **spent NEGATIVE** at ≤2 kHz;
+  the only theoretically live version is a *fractional*-delay (interpolating) parent, which breaks
+  integer-only losslessness.
 
 ### P2 — Temporal prediction saturates early; deeper prediction *hurts* on real data.
 - **Evidence:** order-4 LMS beats order-8 on Hyser and OTB across three independent
@@ -74,8 +131,34 @@ LZMA (1.67× Hyser) is ahead and isn't portable. If the offline best-partner
 - **Implication:** keep the temporal predictor **small (order ≤4)**; spend complexity
   on the spatial front-end. Multiplying predictor **coefficient sets** (an activity-
   regime bank, `LMS4rs`) is the same mistake as deeper order — it fragments adaptation
-  and fits noise; **spent NEGATIVE, retired.** To lower temporal residual entropy the
-  predictor's *functional form* must change (genuinely non-linear), not its tap/set count.
+  and fits noise; **spent NEGATIVE, retired.**
+
+### P2b — The temporal lever is closed over FORM as well as over order and set count: HD-sEMG has no higher-order temporal redundancy to remove.
+- **Evidence (`LMS4v2`, cost 0.0592):** a degree-2 **Volterra** basis (`x²[t−1]`,
+  `x[t−1]x[t−2]`, `x²[t−2]`) added to the *same single* order-4 sign-sign LMS loop, with the
+  *identical* best-partner front-end (a clean single-variable A/B), **lost on all 4 real sets
+  and both synthetic sets**: hyser 1.4758× vs 1.4804× (−0.310%), otb 2.1431× vs 2.1619×
+  (−0.870%), capgmyo 1.3468× vs 1.3505×, cemhsey 1.9521× vs 1.9555×. Retired. The achieved
+  xchan gain dropped on every set (otb +17.41% vs +18.44%) — the `LMS4rs` fingerprint: a worse
+  temporal residual feeds the unchanged spatial stage.
+- **Theory, two layers.** (1) **No signal to fit.** Surface HD-sEMG is a *linear*
+  volume-conductor filtering of superimposed MUAPs — a linear, passive, ~time-invariant
+  medium driven by a near-symmetric excitation ⇒ the process has a **vanishing bispectrum**,
+  so the third-order moments the quadratic taps estimate, `E[e_t·x_{t−i}x_{t−j}] ≈ 0`. The
+  sign-sign gradient is pure noise. This is *stronger* than P2's original claim: the residual
+  is white after order-4 LMS not merely empirically-to-second-order but because the **source
+  process is genuinely linear**, so there is no higher-order redundancy at *any* degree.
+  (2) **A zero-mean gradient still costs bits.** The quadratic taps random-walk about 0; their
+  contribution is a zero-mean `O(x)`-variance disturbance *added* to the residual, and adding
+  an independent zero-mean term strictly raises variance and hence Rice-coded length.
+  **Estimating a parameter whose true value is zero is never free** — the estimator's variance
+  is paid in coded bits. Same accounting as retired `xctx` (P5) and `LMS4rs` (P2), now shown on
+  the predictor's *basis*.
+- **Implication:** the temporal lever is exhausted on all three axes — **order**, **coefficient-set
+  count**, **basis functional form**. Do not propose non-linear temporal predictors (Volterra,
+  gated-magnitude, sign-of-neighbour, NN-flavoured) on this signal. Frontier #2 **spent NEGATIVE**.
+  A self-disabling design (leak-to-zero) is still the right hygiene: it bounded the damage to
+  −0.2…−0.9% instead of divergence and made the result a clean falsification.
 
 ### P3 — For the spatial transform, data-dependent beats data-independent; rank-1 adaptive beats multi-tap.
 - **Evidence:** a fixed 45° integer-KLT captured ~half the adaptive single-neighbour
@@ -122,21 +205,40 @@ LZMA (1.67× Hyser) is ahead and isn't portable. If the offline best-partner
 
 ## Open frontier (ranked by expected payoff/cost)
 
-1. **Scale-select the spatial front-end between the two proven per-scale winners**
-   (P1b): single *selected* best-partner for `C≤64`, jointly-solved best-*pair* for
-   `C≥128`, gated by the decoder-observable channel count (the zero-side-info gate proven
-   by `acar_sel`). Both branches and the gate are already verified; this is the first
-   construction that could clear the best on the primary Hyser *and* hold the tight-array
-   OTB corner. **Highest payoff, lowest mechanism risk.** Risk: the large-array win is only
-   +1.12% at higher cost — measure the full 4-set profile before claiming a promotion.
-2. **Change the predictor's FUNCTIONAL FORM, not its coefficient count** (P2/P5). A
-   linear LMS residual is white *to second order*; any remaining compressibility is
-   higher-order. A small sign-of-neighbour or gated-magnitude nonlinearity (still order
-   ≤4) is the only live temporal lever. Medium payoff, genuinely different axis, higher risk.
-   Pursue only if #1 doesn't clear the best.
-3. **Guarantee #1's large-array branch streams** (P4): confirm its per-block pair
-   re-selection holds the offline ratio (à la `bestpartner_adaptive`). An embeddability
-   guarantee, not a ratio play.
+**Status after cycle 2026-08-07: the two headline frontiers are SPENT.** #1 (scale-select the
+spatial front-end) was *resolved* — the rank gate works mechanically at zero side-info but is
+ratio-neutral (P1c). #2 (change the predictor's functional form) was *falsified* — the source is
+linear, so there is no higher-order temporal redundancy (P2b). Three levers are now measured and
+closed on the *same* underlying finding: **`LMS4 + Rice + any rank-≤2 lag-0 spatial front-end`
+sits on a shared MI ceiling** — all 6 registered variants land within ±1.1% on Hyser and ±0.5%
+elsewhere. Ratio progress now requires reaching redundancy **none** of them addresses.
+
+1. **Non-local / long-range spatial parents** (P1 + P1c + P1d). Every measured front-end draws its
+   parent from the **≤4 immediately-causal grid neighbours** — the ceiling in P1c may be the
+   *neighbourhood's* ceiling, not the array's. Motor-unit territories span 5–10 mm and a single MU
+   fires on **many, non-adjacent** electrodes, so `I(x_c; x_p)` for a distant same-territory channel
+   can rival an adjacent one. Test: keep rank 1 and the proven backward per-block argmin, but widen
+   the *candidate pool* from the 4 grid neighbours to a small set of **distant causal channels**
+   (e.g. same column ±2 rows, or a fixed decimated stride). **Must respect P1d**: keep the option
+   count small (≤8) relative to the block, or lengthen the block, so the added options are not paid
+   for in selection variance. Highest remaining payoff; directly attacks the P1c ceiling; mechanism
+   risk medium.
+2. **Exploit the array's non-stationarity in TIME rather than in space** (P4 + P1c(c)). All spatial
+   parameters are re-selected per 256-sample block, but the *rate* has never been a variable, and
+   P1c showed the selector/estimator coupling (tap-freeze transients) actually **costs** ratio.
+   Test: hold the front-end fixed and vary only the re-selection block length / add hysteresis to the
+   partner decision, so a stable parent stops re-paying estimation noise. Cheap, low-risk, low-payoff
+   (expect ≤0.5%) — but it is the one knob that *reduces* estimator variance rather than adding DOF,
+   which is the direction every negative result this cycle points to.
+3. **Close the LZMA gap where it is real, not where it isn't** (sanity anchors). Offline LZMA still
+   beats every embeddable codec on Hyser (1.67× vs 1.497×) and CEMHSEY (2.06× vs 1.956×) but *loses*
+   on OTB and CapgMyo. LZMA's advantage is **long-range repeated literals across the whole
+   recording**, a form of redundancy no order-4 predictor + memoryless Rice coder can see. Test
+   first as a *diagnostic*, not a codec: measure how much of LZMA's Hyser margin survives on the
+   **post-LMS4+xchan residual stream**. If ~none, the gap is quantization/packing overhead and the
+   frontier is closed; if a lot, a bounded-window match/repeat stage is the next real lever.
+   Diagnostic cost is low and it is the only measurement that can tell us whether ~1.5× is the
+   embeddable ceiling on Hyser.
 
 ## Dead ends — do NOT re-propose (a genuinely different variant must say why)
 
@@ -148,6 +250,19 @@ LZMA (1.67× Hyser) is ahead and isn't portable. If the offline best-partner
   shared mode → over-subtracts. The valid multi-parent form is a *joint* solve (P1b), not a sum.
 - **Activity-regime / coefficient-set predictor bank** (`LMS4rs`): fragments adaptation, fits
   noise once the residual is white (P2). Same failure as `xctx`, predictor side.
+- **Non-linear temporal predictor of any degree** (`LMS4v2`, degree-2 Volterra): surface EMG is a
+  *linear* volume-conductor process, so its bispectrum vanishes and the higher-order moments such a
+  predictor estimates are ≈0 — zero-mean gradient, non-zero estimator variance, paid in coded bits.
+  Lost on all 4 real sets at 1.5× cost (P2b). Closes the temporal lever over *basis form*, not just
+  order/set count.
+- **Propagation-lag-aligned spatial parent** (`xchan_lagbp`): the true inter-electrode delay is
+  **sub-sample** at ≤2 kHz, so `I(x_g[t]; x_p[t−d])` peaks at `d=0`; a 9× wider backward argmin over
+  the same block buys no MI and adds selection variance, worst on tight near-rank-1 arrays (−2.8%
+  OTB) (P1d). A fractional-delay parent is the only live variant and breaks integer losslessness.
+- **Further arbitration/gating among the already-measured spatial front-ends** (`xchan_scalesel`
+  resolved this): a selector cannot exceed the max of its branches, the neighbourhood rank is
+  near-stationary within a recording, and gating an *adaptive* branch costs a tap-freeze transient
+  (P1c). A new front-end must reach redundancy the existing ones don't see, not re-mix them.
 - **Always-on global CAR cascade** (`acar+bestpartner`): superseded by its *scale-gated*
   form `acar_sel` (same tight-array corner, no large-array regression) — always gate a
   geometry-dependent lever on a decoder-observable variable (P1).

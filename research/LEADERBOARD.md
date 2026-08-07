@@ -9,20 +9,37 @@ the append-only cross-cycle ledger is `CYCLE_LOG.md`, and the durable *why* is
 proves (short version: the headline `+xchan` ratios are measured with an offline
 whole-signal beta; the on-node figure is the backward-adaptive variant's).
 
-_Last updated after cycle 2026-07-22 (15 codecs benched, 9 retired). All four real
-sets benched at 15 000 samples: `results/06_real_bench*.csv`._
+_Last updated after cycle 2026-08-07 (20 codec rows benched incl. references, 11 retired).
+All four real sets benched at 15 000 samples: `results/cycle_bench.csv` (120 rows, all
+round-trips bit-exact); search: `results/cycle_search.csv` (60 configs)._
+
+### This cycle (2026-08-07) — 3 candidates, 0 promoted, 2 retired
+
+| candidate | hyser | otb | capgmyo | cemhsey | cost | verifiers | outcome |
+|---|--:|--:|--:|--:|--:|---|---|
+| `LMS4+Rice+xchan_lagbp` | 1.4767× | 2.0923× | 1.3513× | 1.9534× | 0.0706 | PROMOTE / PROMOTE | **RETIRED** — dominated on all 4 real sets by `bestpartner_adaptive` (0.0387); sub-sample propagation delay ⇒ the lag axis buys no MI, only selection variance (−2.8% OTB) |
+| `LMS4+Rice+xchan_scalesel` | **1.4943×** | 2.1530× | **1.3525×** | 1.9516× | 0.0494 | PROMOTE / PROMOTE | **kept, not promoted** — wins Hyser (+0.94%) and CapgMyo (best of any codec) but regresses OTB (−0.41%) and CEMHSEY (−0.20%); 4-set mean tie (+0.044%). Non-dominated |
+| `LMS4v2+Rice+xchan_bestpartner` | 1.4758× | 2.1431× | 1.3468× | 1.9521× | 0.0592 | PROMOTE / PROMOTE | **RETIRED** — dominated on all 4 real sets by the headline (0.0394); degree-2 Volterra taps fit a bispectrum that vanishes for a linear volume-conductor source |
+
+**Headline unchanged.** No candidate beat the current best on real data. The cycle's durable
+result is negative-and-informative: the spatial front-end's *choice* and the temporal predictor's
+*functional form* are both now measured-and-closed levers (INSIGHTS P1c, P1d, P2b).
 
 ## Best embeddable: `LMS4+Rice+xchan_bestpartner` (cost 0.039)
 
 Order-4 sign-sign LMS + adaptive Golomb-Rice, per-channel best-of-4 causal-neighbour
 cross-channel subtract. Best embeddable on **every** real set; only offline LZMA is ahead.
 
-| dataset | ch | best-emb ratio | %-of-FLAC | FLAC | best offline ref |
-|---|--:|--:|--:|--:|---|
-| **hyser_1dof_f1_s1** (primary) | 128 | **1.480×** | 151% | 0.98× | lzma 1.67× |
-| otb_hdsemg_vl | 64 | **2.162×** | 176% | 1.23× | wavpack 1.85× (emb-class) |
-| cemhsey_s1_d1t1 | 320 | **1.956×** | 167% | 1.17× | lzma 2.06× |
-| capgmyo_dba_s1 | 128 | **1.350×** | 137% | 0.98× | wavpack 1.35× |
+| dataset | ch | headline ratio | %-of-FLAC | FLAC | best offline ref | best *any* embeddable (corner codec) |
+|---|--:|--:|--:|--:|---|---|
+| **hyser_1dof_f1_s1** (primary) | 128 | **1.480×** | 151% | 0.98× | lzma 1.67× | 1.4969× `xchan_jointbp2` |
+| otb_hdsemg_vl | 64 | **2.162×** | 176% | 1.23× | wavpack 1.85× (emb-class) | 2.1795× `acar_sel+bestpartner` |
+| cemhsey_s1_d1t1 | 320 | **1.956×** | 167% | 1.17× | lzma 2.06× | 1.9555× (headline) |
+| capgmyo_dba_s1 | 128 | **1.350×** | 137% | 0.98× | wavpack 1.35× | 1.3525× `xchan_scalesel` |
+
+The headline is the only codec that is **best-or-tied on every set within 0.5%**; the corner
+column shows no single codec holds all four. INSIGHTS **P1c** now argues that ±1.1% spread is a
+shared spatial-MI ceiling, not a mechanism gap.
 
 ### Primary — real Hyser reference bar
 
@@ -49,10 +66,18 @@ cross-channel subtract. Best embeddable on **every** real set; only offline LZMA
 
 | config | ratio | cost | neural_ok | character |
 |---|---:|---:|:--:|---|
-| delta+Rice+xchan | 1.453× | 0.016 | ✅ | cheapest embeddable with xchan (fixed predictors only) |
-| `lms4s7+x6/b512` (search pick) | 1.478× | 0.027 | ✅ | best **value/minimal-hardware** (single parent, zero partner side-info) |
-| LMS+Rice+xchan_joint2 | 1.493× | 0.037 | ✅ | zero-side-info joint 2-parent (wins Hyser only) |
-| LMS4+Rice+xchan_bestpartner | 1.480× | 0.039 | ✅ | **best-ratio robust across all 4 sets** (best-of-4 partner) |
+| delta+Rice+xchan | 1.4516× | 0.0127 | ✅ | cheapest embeddable with xchan (fixed predictors only) |
+| `lms4s7+x6/b512` (search pick) | 1.478× | 0.0271 | ✅ | best **value/minimal-hardware** (single parent, zero partner side-info) |
+| LMS+Rice+xchan_joint2 | 1.4930× | 0.0366 | ✅ | zero-side-info joint 2-parent (wins Hyser only) |
+| LMS4+Rice+xchan_bestpartner_adaptive | 1.4770× | 0.0387 | ✅ | zero-side-info streaming realization of the headline (look-ahead 0) |
+| LMS4+Rice+xchan_bestpartner | 1.4804× | 0.0394 | ✅ | **best-ratio robust across all 4 sets** (best-of-4 partner) |
+| LMS4+Rice+acar_sel+bestpartner | 1.4804× | 0.0430 | ✅ | OTB max-ratio corner (2.1795×), no large-array regression |
+| LMS4+Rice+xchan_jointbp2 | 1.4969× | 0.0468 | ✅ | Hyser max-ratio corner (joint best-pair) |
+| LMS4+Rice+xchan_scalesel | 1.4943× | 0.0494 | ✅ | *new this cycle* — CapgMyo max corner (1.3525×); zero-side-info rank gate holding **both** per-scale branches from one codec |
+
+Search (`results/cycle_search.csv`, 60 configs, mean over hyser+otb) is unchanged: converged to
+`lms4s7+x6/b512`, mean **1.8204×**, cost 0.0271, `embedded_ok`/`neural_ok` OK. Ablation from best:
+cross-channel on→off **−14.83%**, order 4→8 −0.79%, shift 7→8 −0.16%, block 512→256 −0.15%.
 
 ### What mattered (search ablation from best, real Hyser)
 | axis | Δ ratio | |
