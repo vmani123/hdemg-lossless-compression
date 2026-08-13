@@ -2325,6 +2325,695 @@ def rsbp_decode(buf):
 
 
 # ===========================================================================
+# NEW candidate: PROPAGATION-DELAY-ALIGNED cross-channel prediction
+# (LMS4+Rice+xchan_lag) -- a rank-1 subtract at a backward-selected non-zero LAG.
+# ---------------------------------------------------------------------------
+# EVERY registered spatial front-end subtracts its parent at LAG ZERO: `_bp_select`
+# / `_bpa_select_block` / `_xj2_forward` / `_jbp2_forward` / `_acar_forward` all
+# form `x[c,t] - ((beta * x[p,t]) >> s)` -- same t, elementwise. Lag 0 captures only
+# the INSTANTANEOUS (transversal) slice of the cross-channel mutual information.
+#
+# The physics says that is the wrong slice for an HD-sEMG grid. The signal is
+# dominated by MUAPs PROPAGATING along the muscle fibres at ~3-5 m/s; with an
+# 8-10 mm inter-electrode distance at 2048 Hz, the along-fibre neighbour is a
+# near-replica DELAYED by ~2-5 samples -- about a quarter cycle at the ~100 Hz
+# spectral peak. A zero-lag subtract therefore sees a PHASE-ROTATED copy and
+# throws that MI away. Information-theoretically the achievable rank-1 subtract
+# gain is set by max_d coherence(c, p; d), not by coherence at d = 0; aligning d
+# converts an apparently decorrelated pair into a high-coherence one and so
+# ENLARGES the lever INSIGHTS P1 proves is dominant, instead of re-dividing it.
+#
+# Mechanism (backward-adaptive, zero side-info -- INSIGHTS P4):
+#   * For channel c and block i>0, over the PREVIOUS already-reconstructed RAW
+#     block, scan every (parent p, lag d) pair with p in the same <=4 causal grid
+#     neighbours as the promoted best (`_bp_candidates`, all grid idx < c) and
+#     d in {0..XLAG_MAXD}. For each, derive the integer least-squares gain
+#     (`_bp_opt_beta`, reused verbatim) between x_c and the LAG-SHIFTED parent,
+#     and score the resulting cross-residual's estimated Rice bits (`_bp_score`);
+#     the no-parent option is scored too. Keep the min-bits (p, d, beta).
+#   * Apply that triple to the CURRENT block as a rank-1 subtract at the lag:
+#         y[c,t] = x[c,t] - ((beta * x[p, t-d]) >> shift)
+#     d >= 0 reaches into OLDER parent history, so the front-end is strictly MORE
+#     causal than the lag-0 incumbents: look-ahead stays 0.
+#   * Because reconstruction is lossless and every candidate parent has grid idx
+#     < c, the decoder holds the bit-identical raw previous block and parent rows
+#     and re-runs the IDENTICAL integer search -> the (p, d, beta) triple is NEVER
+#     transmitted. Block 0 bootstraps to no-parent (coded as-is), as in
+#     `bestpartner_adaptive`.
+#
+# NOT a re-proposal of any existing/retired mechanism -- it moves the predictor's
+# support in TIME, an axis no registered codec touches:
+#   - vs PROMOTED `bestpartner` / `bestpartner_adaptive` (WHICH parent): same
+#     4-neighbourhood and same integer-LS gain, but the parent may now be read at
+#     d > 0. Setting XLAG_MAXD = 0 would reduce this codec EXACTLY to
+#     `bestpartner_adaptive` -- the lag is the only new degree of freedom.
+#   - vs `xchan_joint2` / `xchan_jointbp2` (HOW MANY parents): the subtract stays
+#     strictly RANK-1, one parent, one gain -- so it also stays clear of the
+#     multi-tap spatial-transform dead end (INSIGHTS P3).
+#   - vs RETIRED `xchan_multiparent` (summed marginal betas -> over-subtract):
+#     one parent only, so no shared mode is double-counted.
+#   - vs RETIRED `iklt`/`iklt_adaptive`: asymmetric residual-only injection; the
+#     parent rows stay clean (INSIGHTS P3 refinement), no rotation.
+#   - the temporal predictor is UNCHANGED order-4 sign-sign LMS + adaptive Rice
+#     (INSIGHTS P2/P5): this spends nothing on the temporal or entropy axes.
+#
+# FALSIFIABLE PREDICTIONS to measure: on a transversally-mounted array the winning
+# d collapses to 0 and the gain vanishes (the codec degenerates to
+# `bestpartner_adaptive`); CapgMyo -- the differential-montage negative control
+# whose neighbour |corr| is only 0.29 -- is the best upside test, because a
+# differential montage kills the zero-lag common mode but CANNOT kill the
+# propagation delay.
+#
+# Bases (paper-reported, unverified here): MPEG-4 ALS's multichannel coding tool
+# uses a TIME-LAGGED cross-prediction filter against a selected reference channel
+# (Liebchen et al.); muscle-fibre conduction velocity is itself estimated by
+# maximizing the along-fibre HD-sEMG cross-correlation AT A DELAY (XCC ~0.7-0.8 at
+# the correct lag; Farina & Merletti, openhdemg); Itiki, Furuie & Merletti
+# (BioMed Eng OnLine 2014;13:25) report transversal vs longitudinal channel
+# ordering behaves differently for HD-EMG compression.
+# ===========================================================================
+XLAG_MAGIC = 0x4C58        # 'LX' (lag-aligned cross-channel)
+XLAG_BLOCK = ec.BLOCK      # re-selection block (aligns with the Rice block)
+XLAG_ORDER = LMS4_ORDER    # order-4 temporal base behind the spatial front-end (P2)
+XLAG_MAXD = 8              # max propagation lag D (samples); 2-5 expected at 2 kHz
+
+
+def _xlag_slice(row, s, e, d):
+    """The parent segment [s-d, e-d) of a channel row, zero-filled for indices
+    < 0 (samples before the recording start). Integer-only and deterministic, so
+    encoder and decoder -- which hold bit-identical parent rows -- build the same
+    lagged segment. Note d >= 0 only reads OLDER samples: strictly causal."""
+    a, b = int(s) - int(d), int(e) - int(d)
+    if a >= 0:
+        return row[a:b]
+    head = np.zeros(-a, np.int64)
+    if b <= 0:
+        return np.zeros(int(e) - int(s), np.int64)
+    return np.concatenate((head, row[0:b].astype(np.int64)))
+
+
+def _xlag_select_block(xc_prev, x, cands, ps, pe, maxd=XLAG_MAXD):
+    """Backward per-block (parent, lag, beta) selection from the PREVIOUS raw
+    block. Extends `_bpa_select_block` with the LAG axis: every (candidate parent,
+    lag d in 0..maxd) pair is given its integer least-squares gain and scored in
+    estimated Rice bits over block i-1; the no-parent option is scored too. Ties
+    resolve to the first (lowest p, then lowest d) candidate, deterministically.
+    Integer-only, so encode and decode -- both holding the bit-identical
+    reconstructed previous block -- derive the identical triple."""
+    best_bits = _bp_score(xc_prev)             # option: no cross-channel subtract
+    best_p, best_d, best_b = -1, 0, 0
+    for p in cands:
+        for d in range(int(maxd) + 1):
+            xp = _xlag_slice(x[p], ps, pe, d)
+            b = _bp_opt_beta(xc_prev, xp, BP_SHIFT)
+            if b == 0:
+                continue
+            bits = _bp_score(xc_prev - ((b * xp) >> BP_SHIFT))
+            if bits < best_bits:
+                best_bits, best_p, best_d, best_b = bits, p, d, b
+    return best_p, best_d, best_b
+
+
+def _xlag_forward(x, cols, B=XLAG_BLOCK, maxd=XLAG_MAXD):
+    """Propagation-delay-aligned rank-1 cross-channel decorrelation. Block i's
+    (parent, lag, beta) come from the PREVIOUS raw block (block 0 -> no parent);
+    the subtract reads the parent at t-d. Returns the transformed [C, N] int64."""
+    C, N = x.shape
+    x = x.astype(np.int64)
+    y = x.copy()
+    nblocks = (N + B - 1) // B
+    for g in range(C):
+        cands = _bp_candidates(g, cols, C)
+        if not cands:                          # grid origin: no causal neighbour
+            continue
+        for i in range(1, nblocks):            # block 0 is coded as-is (no prior)
+            s, e = i * B, min((i + 1) * B, N)
+            ps, pe = (i - 1) * B, i * B
+            p, d, b = _xlag_select_block(x[g, ps:pe], x, cands, ps, pe, maxd)
+            if p >= 0:
+                y[g, s:e] = x[g, s:e] - ((b * _xlag_slice(x[p], s, e, d)) >> BP_SHIFT)
+    return y
+
+
+def _xlag_inverse(y, cols, B=XLAG_BLOCK, maxd=XLAG_MAXD):
+    """Invert _xlag_forward. Every candidate parent has grid idx < g so its whole
+    row (including the t-d history the subtract reads) is reconstructed before g;
+    within a channel we rebuild raw block-by-block in time order, so block i-1 is
+    restored before block i and the SAME (parent, lag, beta) is recomputed from
+    it -- mirroring the encoder exactly."""
+    C, N = y.shape
+    y = y.astype(np.int64)
+    x = y.copy()
+    nblocks = (N + B - 1) // B
+    for g in range(C):
+        cands = _bp_candidates(g, cols, C)
+        if not cands:
+            continue
+        for i in range(1, nblocks):
+            s, e = i * B, min((i + 1) * B, N)
+            ps, pe = (i - 1) * B, i * B
+            p, d, b = _xlag_select_block(x[g, ps:pe], x, cands, ps, pe, maxd)
+            if p >= 0:
+                x[g, s:e] = y[g, s:e] + ((b * _xlag_slice(x[p], s, e, d)) >> BP_SHIFT)
+    return x
+
+
+def xlag_encode(x, cols=16):
+    x = np.asarray(x, np.int64)
+    C, N = x.shape
+    y = _xlag_forward(x, cols)                       # lag-aligned rank-1 front-end
+    res = ec.lms_forward(y, order=XLAG_ORDER)        # order-4 sign-sign LMS (P2)
+    body = b"".join(ec.rice_encode_1d(res[c]) for c in range(C))
+    hdr = struct.pack("<HHII", XLAG_MAGIC, cols, C, N)  # NO (parent,lag,beta) side-info
+    return hdr + body
+
+
+def xlag_decode(buf):
+    magic, cols, C, N = struct.unpack_from("<HHII", buf, 0)
+    assert magic == XLAG_MAGIC, "bad lag-aligned cross-channel codec magic"
+    off = 12
+    res = np.empty((C, N), np.int64)
+    for c in range(C):
+        arr, off = ec.rice_decode_1d(buf, off)
+        res[c] = arr
+    y = ec.lms_inverse(res, order=XLAG_ORDER)        # matched order-4 inverse
+    x = _xlag_inverse(y, cols)
+    return x.astype(np.int16)
+
+
+# ===========================================================================
+# NEW candidate: max-MI (Chow-Liu) SPANNING-TREE channel topology
+# (LMS4+Rice+xchan_mst).
+# ---------------------------------------------------------------------------
+# Every registered spatial front-end inherits the RASTER-CAUSAL parent set:
+# `_bp_candidates` offers channel c only {left, up, up-left, up-right} -- the
+# four 8-neighbours whose grid index is < c. That restriction exists purely so
+# the decoder can walk channels in INDEX order; it is not a property of the
+# array. Structurally it throws away exactly half the 8-neighbourhood (right,
+# down, down-left, down-right), and the per-channel GREEDY pick under an
+# arbitrary scan order is not the optimal parent structure even among the
+# parents it can see. Row 0 has only `left`; column 0 has only up/up-right; and
+# any channel whose strongest correlate happens to lie LATER in raster order is
+# forced onto a strictly weaker parent. That loss is structural, not a tuning
+# issue.
+#
+# Chow & Liu (IEEE Trans. IT, 1968) settle what the right structure is: among
+# all tree factorizations of a joint distribution, the MAXIMUM-WEIGHT SPANNING
+# TREE under pairwise-MUTUAL-INFORMATION edge weights is the one minimizing KL
+# divergence to the true joint -- i.e. exactly the entropy-minimizing rank-1
+# dependency structure the current front-end is greedily approximating. Under a
+# Gaussian model the edge weight is -1/2 log(1-rho^2), so the MST maximizes the
+# total REMOVABLE MI over all trees. This codec replaces the raster parent set
+# with that tree.
+#
+# Mechanism (backward-adaptive, zero side-info -- INSIGHTS P4):
+#   * CANDIDATE GRAPH: the undirected 8-neighbourhood of the electrode grid
+#     (each adjacent pair once, diagonals included) -- ~4 edges per channel, a
+#     bounded ~2x the incumbent's 4 raster candidates. NOT the complete graph:
+#     embeddability caps the edge set (see cost_model.md).
+#   * EDGE WEIGHT (integer, backward): over the PREVIOUS already-reconstructed
+#     RAW block, for BOTH orientations of edge (u,v) derive the integer
+#     least-squares gain (`_bp_opt_beta`, verbatim) and measure the CODED-BIT
+#     SAVING in estimated Rice bits (`_bp_score`, verbatim):
+#         w(u,v) = max(0, bits(u) - bits(u - b_uv*v)) + max(0, bits(v) - bits(v - b_vu*u))
+#     A directional coded-bit saving is the operational estimate of N*I(u;v)
+#     (bits actually removable by a rank-1 subtract); summing the two
+#     orientations gives a SYMMETRIC estimator -- the integer stand-in for
+#     Chow-Liu's symmetric MI -- and clamping each at 0 mirrors I >= 0. No
+#     float, no division beyond the rounded integer LS ratio.
+#   * TREE: Kruskal + union-find over those integer weights (descending weight,
+#     ties broken by (u,v) index -- fully deterministic), giving the max-weight
+#     spanning tree of the 8-neighbour graph. Root at the lowest-index node of
+#     each component and orient edges away from the root by BFS (neighbours
+#     visited in ascending index) -> a `parent[]` array plus a topological
+#     channel ORDER. Rooting is free in Chow-Liu: any rooting of the same
+#     undirected tree is the same factorization.
+#   * SUBTRACT: one rank-1 adaptive subtract per TREE EDGE, applied to the
+#     CURRENT block, y[c] = x[c] - ((beta_c * x[parent(c)]) >> shift), with
+#     beta_c the same previous-block integer-LS gain already scored for that
+#     orientation; if that orientation's saving was <= 0 the edge is coded with
+#     beta = 0 (channel as-is), the tree structure being unchanged. Every
+#     channel keeps EXACTLY ONE parent.
+#   * CAUSALITY / ZERO SIDE-INFO: the tree is derived only from block i-1, which
+#     the decoder holds bit-identically (lossless), so it rebuilds the IDENTICAL
+#     tree and gains -- nothing is transmitted, look-ahead 0. Because a parent
+#     may now have a HIGHER index than its child, the decoder inverts block i in
+#     TREE ORDER (root -> leaves) instead of index order; each parent's block-i
+#     raw samples are restored before its children read them. Block 0 bootstraps
+#     to no parent (coded as-is), exactly like `bestpartner_adaptive`.
+#
+# NOT a re-proposal of anything registered or retired -- the new axis is the
+# parent GRAPH (topology), not the gain, the count, or the time offset:
+#   - vs PROMOTED `bestpartner` / `bestpartner_adaptive`: same rank-1 subtract,
+#     same integer-LS gain, same Rice-bit scoring -- but the parent set is the
+#     FULL 8-neighbourhood and the structure is globally optimal over trees
+#     rather than greedy per channel under a raster order. Restricting the
+#     candidate graph to the raster half-neighbourhood and forcing index-order
+#     traversal would collapse this back toward `bestpartner_adaptive`.
+#   - vs `xchan_lag` (this cycle): that moves the parent in TIME (lag d); this
+#     moves it in the channel GRAPH. Orthogonal, both rank-1.
+#   - vs `xchan_joint2` / `xchan_jointbp2` (HOW MANY parents): the subtract stays
+#     strictly RANK-1 -- one parent, one gain per channel -- so this is NOT the
+#     P3 multi-tap-transform dead end.
+#   - vs RETIRED `xchan_multiparent` (summed marginal betas -> over-subtract):
+#     each channel still has exactly ONE parent, so no shared mode is
+#     double-counted (INSIGHTS P1b).
+#   - vs RETIRED `iklt` / `iklt_adaptive`: no rotation; the subtract is
+#     asymmetric, injecting estimation noise only into the child's residual
+#     while the parent row stays clean (INSIGHTS P3 refinement).
+#   - temporal back-end UNCHANGED: order-4 sign-sign LMS + adaptive Rice
+#     (INSIGHTS P2/P5). Nothing is spent on the temporal or entropy axes.
+#
+# EMBEDDABILITY (cost_model.md): the edge set is the 8-neighbourhood, so the
+# per-block backward scan is ~2x `bestpartner_adaptive`'s (~4 incident edges x 2
+# orientations per channel vs 4 candidates); Kruskal/union-find over ~4C edges
+# (~500 at 128 ch) is <0.05 ops/sample-ch amortised over a 256-sample block;
+# all comparisons are integer bit-counts. Extra persistent state over the
+# order-4 LMS base is parent id + traversal position + the int16 gain (~4 B/ch,
+# ~0.5 KB at 128 ch). PORT NOTE (flagged, not hidden): decoding follows a tree
+# traversal, so channel access is a PERMUTATION -- indirect BRAM addressing on
+# the Spartan-7 (cheap, but no longer a linear channel sweep); the ENCODER, which
+# is what runs on-node, still touches channels in any order it likes.
+#
+# FALSIFIABLE PREDICTIONS to measure: the gain should be largest where the
+# raster restriction bites hardest -- boundary-heavy geometries and arrays whose
+# dominant correlate is anisotropic (not aligned with the scan). If the raster
+# half-neighbourhood already contains each channel's best correlate, the MST
+# degenerates toward the greedy parent set and the gain is ~0 at ~2x selection
+# cost, which would be a clean negative.
+#
+# CITATIONS (paper-reported, unverified here): Chow & Liu, "Approximating
+# discrete probability distributions with dependence trees", IEEE Trans. IT
+# 14(3):462-467, 1968; correlation-driven rather than geometry-driven channel
+# grouping in biosignals -- "Efficient lossless multi-channel EEG compression
+# based on channel clustering" (Biomed. Signal Process. Control, 2016) and
+# "Low-complexity lossless multichannel ECG compression based on selective
+# linear prediction" (2019), the latter being the single-parent-selection
+# analogue already shipped here -- the tree is its global-optimality upgrade.
+# ===========================================================================
+XMST_MAGIC = 0x544D        # 'MT' (max-MI spanning-tree channel topology)
+XMST_BLOCK = ec.BLOCK      # tree-rebuild block (aligns with the Rice block)
+XMST_ORDER = LMS4_ORDER    # order-4 temporal base behind the spatial front-end (P2)
+
+
+def _xmst_edges(C, cols):
+    """Undirected 8-neighbour candidate edge set of the electrode grid, each
+    adjacent pair listed exactly once (right, down-left, down, down-right from
+    every channel). Bounded at ~4 edges/channel -- the embeddability cap that
+    keeps this a Chow-Liu tree over a SPARSE graph, not the complete graph."""
+    cols = max(1, int(cols))
+    edges = []
+    for g in range(C):
+        r, c = divmod(g, cols)
+        for dr, dc in ((0, 1), (1, -1), (1, 0), (1, 1)):
+            rr, cc = r + dr, c + dc
+            if cc < 0 or cc >= cols:
+                continue
+            h = rr * cols + cc
+            if h < C:
+                edges.append((g, h))
+    return edges
+
+
+def _xmst_dir_gain(xc_prev, xp_prev, base_bits):
+    """Directional (beta, coded-bit saving) for predicting channel c from parent
+    p over the previous block: the integer least-squares gain (`_bp_opt_beta`)
+    and how many estimated Rice bits the rank-1 subtract removes (`_bp_score`).
+    The saving is the operational integer estimate of N*I(c;p) -- bits actually
+    removable by a rank-1 subtract. Integer-only and deterministic."""
+    b = _bp_opt_beta(xc_prev, xp_prev, BP_SHIFT)
+    if b == 0:
+        return 0, 0
+    resid = xc_prev - ((b * xp_prev) >> BP_SHIFT)
+    return b, base_bits - _bp_score(resid)
+
+
+def _xmst_kruskal(C, wedges):
+    """Maximum-weight spanning tree by Kruskal + union-find over integer edge
+    weights. Edges are taken in descending weight with ties broken by (u, v)
+    index, so the tree is a deterministic function of the previous block alone
+    -- encoder and decoder, holding bit-identical history, build the same one.
+    Returns the adjacency list of the chosen (undirected) tree edges."""
+    par = list(range(C))
+
+    def find(a):
+        while par[a] != a:
+            par[a] = par[par[a]]        # path halving
+            a = par[a]
+        return a
+
+    adj = [[] for _ in range(C)]
+    for w, u, v in sorted(wedges, key=lambda t: (-t[0], t[1], t[2])):
+        ru, rv = find(u), find(v)
+        if ru != rv:
+            par[ru] = rv
+            adj[u].append(v)
+            adj[v].append(u)
+    return adj
+
+
+def _xmst_root(adj, C):
+    """Root the undirected tree and orient its edges away from the root: BFS
+    from the lowest-index node of each component, neighbours visited in
+    ascending index. Returns (parent[], order) where order lists every channel
+    AFTER its parent -- the traversal the decoder inverts in. Rooting is free in
+    Chow-Liu: any rooting of the same undirected tree is the same factorization
+    (a disconnected candidate graph simply yields several roots)."""
+    parent = np.full(C, -1, np.int64)
+    order = []
+    seen = [False] * C
+    for root in range(C):
+        if seen[root]:
+            continue
+        seen[root] = True
+        order.append(root)
+        queue = [root]
+        qi = 0
+        while qi < len(queue):
+            u = queue[qi]
+            qi += 1
+            for v in sorted(adj[u]):
+                if not seen[v]:
+                    seen[v] = True
+                    parent[v] = u
+                    order.append(v)
+                    queue.append(v)
+    return parent, order
+
+
+def _xmst_block_tree(x, ps, pe, edges, C):
+    """Rebuild the Chow-Liu max-MI spanning tree for one block from the PREVIOUS
+    already-reconstructed RAW block x[:, ps:pe]. Returns (parent, betas, order):
+    parent[c] = tree parent (-1 for a root), betas[c] = the integer gain of that
+    tree edge (0 if the subtract does not pay), order = root->leaf traversal.
+    Integer-only and deterministic -> encoder and decoder derive it identically
+    and NOTHING is transmitted."""
+    prev = x[:, ps:pe]
+    base = [_bp_score(prev[c]) for c in range(C)]
+    dgain = {}
+    wedges = []
+    for (u, v) in edges:
+        b_uv, s_uv = _xmst_dir_gain(prev[u], prev[v], base[u])   # u predicted from v
+        b_vu, s_vu = _xmst_dir_gain(prev[v], prev[u], base[v])   # v predicted from u
+        dgain[(u, v)] = (b_uv, s_uv)        # key = (child, parent)
+        dgain[(v, u)] = (b_vu, s_vu)
+        # symmetric integer MI proxy: both orientations' removable bits, clamped
+        # at 0 (mutual information is non-negative; a negative saving is noise)
+        wedges.append(((s_uv if s_uv > 0 else 0) + (s_vu if s_vu > 0 else 0), u, v))
+    parent, order = _xmst_root(_xmst_kruskal(C, wedges), C)
+    betas = np.zeros(C, np.int64)
+    for c in range(C):
+        p = int(parent[c])
+        if p >= 0:
+            b, s = dgain[(c, p)]
+            if s > 0:                        # only subtract when it pays
+                betas[c] = b
+    return parent, betas, order
+
+
+def _xmst_forward(x, cols, B=XMST_BLOCK):
+    """Spanning-tree cross-channel decorrelation. Block i's tree + gains come
+    from the PREVIOUS raw block (block 0 -> no parent, coded as-is); one rank-1
+    subtract per tree edge is applied to block i of the RAW signal. The encoder
+    reads only raw channels, so it needs no traversal order."""
+    C, N = x.shape
+    x = x.astype(np.int64)
+    y = x.copy()
+    if C < 2:
+        return y
+    edges = _xmst_edges(C, cols)
+    nblocks = (N + B - 1) // B
+    for i in range(1, nblocks):
+        s, e = i * B, min((i + 1) * B, N)
+        parent, betas, _ = _xmst_block_tree(x, (i - 1) * B, i * B, edges, C)
+        for c in range(C):
+            p, b = int(parent[c]), int(betas[c])
+            if p >= 0 and b != 0:
+                y[c, s:e] = x[c, s:e] - ((b * x[p, s:e]) >> BP_SHIFT)
+    return y
+
+
+def _xmst_inverse(y, cols, B=XMST_BLOCK):
+    """Invert _xmst_forward. A tree parent may have a HIGHER index than its
+    child, so blocks are rebuilt in TREE ORDER (root -> leaves) rather than
+    channel order: each parent's block-i raw samples are restored before its
+    children read them. Block i-1 is fully reconstructed for every channel
+    before block i's tree is rebuilt from it, so the decoder derives the SAME
+    tree and gains as the encoder."""
+    C, N = y.shape
+    y = y.astype(np.int64)
+    x = y.copy()
+    if C < 2:
+        return x
+    edges = _xmst_edges(C, cols)
+    nblocks = (N + B - 1) // B
+    for i in range(1, nblocks):
+        s, e = i * B, min((i + 1) * B, N)
+        parent, betas, order = _xmst_block_tree(x, (i - 1) * B, i * B, edges, C)
+        for c in order:
+            p, b = int(parent[c]), int(betas[c])
+            if p >= 0 and b != 0:
+                x[c, s:e] = y[c, s:e] + ((b * x[p, s:e]) >> BP_SHIFT)
+    return x
+
+
+def xmst_encode(x, cols=16):
+    x = np.asarray(x, np.int64)
+    C, N = x.shape
+    y = _xmst_forward(x, cols)                       # Chow-Liu tree front-end
+    res = ec.lms_forward(y, order=XMST_ORDER)        # order-4 sign-sign LMS (P2)
+    body = b"".join(ec.rice_encode_1d(res[c]) for c in range(C))
+    hdr = struct.pack("<HHII", XMST_MAGIC, cols, C, N)   # NO tree/beta side-info
+    return hdr + body
+
+
+def xmst_decode(buf):
+    magic, cols, C, N = struct.unpack_from("<HHII", buf, 0)
+    assert magic == XMST_MAGIC, "bad spanning-tree cross-channel codec magic"
+    off = 12
+    res = np.empty((C, N), np.int64)
+    for c in range(C):
+        arr, off = ec.rice_decode_1d(buf, off)
+        res[c] = arr
+    y = ec.lms_inverse(res, order=XMST_ORDER)        # matched order-4 inverse
+    x = _xmst_inverse(y, cols)
+    return x.astype(np.int16)
+
+
+# ===========================================================================
+# NEW candidate: CONTEXT BIAS-CANCELLATION two-stage predictor
+# (LMS4bc+Rice+xchan_bestpartner) -- a JPEG-LS/CALIC-style per-context running-mean
+# corrector bolted onto the promoted order-4 sign-sign LMS.
+# ---------------------------------------------------------------------------
+# THE TEMPORAL LEVER (INSIGHTS frontier #2), deliberately a different axis from the
+# spatial candidates in this cycle.
+#
+# WHY THERE IS ANYTHING LEFT. A linear predictor whitens only to SECOND order: it can
+# zero E[e * x[t-i]] for its taps, but nothing forces the CONDITIONAL mean E[e | ctx]
+# to vanish for a nonlinear function of the past. Worse, the shipped predictor is
+# SIGN-SIGN LMS, which is not even MMSE-optimal -- it descends a sign-gradient
+# (signed-error x signed-regressor) criterion whose fixed point is offset from the
+# Wiener solution, and its constant +-1 weight steps never settle, leaving a
+# persistent MISADJUSTMENT. Both effects leave the residual with a small but
+# systematic CONTEXT-DEPENDENT DC term. Since H(e) >= H(e - E[e|ctx]) (subtracting a
+# causally-known constant per context cannot raise entropy, and strictly lowers the
+# second moment by E[mu_ctx^2]), removing that DC shortens the Rice code by about
+# 1/2 * log2(1 + E[mu^2]/sigma^2) bits/sample. This is precisely the mechanism behind
+# JPEG-LS's per-context bias corrector (Weinberger, Seroussi & Sapiro, LOCO-I) and
+# CALIC's context error feedback (paper-reported, unverified here), which is where
+# their measurable gain over the bare MED predictor comes from.
+#
+# MECHANISM (two stages, both backward-adaptive, zero side-info):
+#   stage 1 - the incumbent order-4 sign-sign LMS, UNCHANGED: e[t] = x[t] - pred[t].
+#   stage 2 - d[t] = e[t] - mu[c, ctx[t]], where mu is a per-(channel, context)
+#             running mean of the raw stage-1 residual, held as a leaky integrator
+#             S += e - (S >> BC_MU_W) and read back as mu = (S + half) >> BC_MU_W.
+#             Shift-divide only: NO multiplies and NO divides in the corrector.
+#   The Rice back-end codes d. The LMS adaptation and history still use the
+#   PRE-correction e (the decoder recovers e = d + mu before updating), so stage 1 is
+#   bit-identical to `LMS4+Rice+xchan_bestpartner`'s predictor and stage 2 is a pure
+#   ADDITIVE second stage -- the predictor's FUNCTIONAL FORM gains a nonlinear
+#   conditional-mean term, which is exactly the change P2 demands (not more taps, not
+#   more coefficient sets).
+#
+# CONTEXT (30 buckets, <= 32): the quantized last two residuals plus one cross-channel
+# sign bit -- q5(e[t-1]) x q3(e[t-2]) x sign(d[parent, t-1]). Quantizer thresholds are
+# 0.5x and 1.5x the channel's backward leaky mean |e|, so the buckets are SCALE-FREE
+# and stay meaningful across bursts and quiescence. The parent bit is taken at LAG 1
+# (the parent's already-coded residual) so the per-sample update stays a single
+# vectorized channel sweep with no intra-sample channel chain -- strictly causal on
+# both sides.
+#
+# WHY THIS IS NOT A RETIRED LEVER (stated explicitly):
+#   * `LMS+Rice+xctx` (retired, cycle 9) conditioned the RICE SCALE PARAMETER k on a
+#     cross-channel energy context. It lost because adaptive-k already tracks scale
+#     and the extra model is pure loss (P5). Here the CODER IS UNTOUCHED -- one
+#     global adaptive-Rice back-end, no context-split frequency table, no k model.
+#     What is conditioned is a FIRST MOMENT of the residual, upstream of the coder;
+#     P5's finding was about the second moment / the code's parameter.
+#   * `LMS4rs+Rice+xchan_bestpartner` (retired, cycle 14) forked WHOLE COEFFICIENT
+#     SETS by activity regime. It lost because it fragments the adaptation and fits
+#     noise (P2). Here there is exactly ONE global predictor and ONE weight set,
+#     adapting on every sample as before; the context indexes a single scalar mean,
+#     the cheapest possible statistic, which cannot fragment the predictor's learning.
+#   * Not a spatial mechanism at all: the proven best-partner front-end (`_bp_select`
+#     / `_bp_inverse`) is reused VERBATIM, identical side-info, identical inverse.
+#
+# EMBEDDABILITY (cost_model.md): one int32 accumulator per bucket (30 x 4 B = 120 B/ch,
+# ~15 KB at 128 ch), a handful of compares to form the context, one gather, one
+# shift-add to read mu, one add/shift/sub to update it. No multiplies, no divides, no
+# look-ahead, ZERO side-info (the decoder rebuilds every table from reconstructed
+# history), so it fits both the 2 kS/s and the tight 30 kHz budgets.
+#
+# HONEST RISK (recorded before measuring): P5 already found the post-LMS residual
+# near-white, so E[mu^2]/sigma^2 may be tiny; the estimator itself injects variance
+# ~sigma^2/(2^BC_MU_W) per bucket, which can EXCEED the bias it removes. The image-
+# coding analogy suggests only ~1-2%. A clean negative here would be a genuine result:
+# it would show the sign-sign misadjustment leaves no exploitable conditional mean.
+# ===========================================================================
+BC_MAGIC = 0x4342        # 'BC' (context bias-cancellation)
+BC_ORDER = LMS4_ORDER    # order-4 temporal predictor (INSIGHTS P2), unchanged
+BC_SHIFT = ec.LMS_SHIFT  # fixed-point weight scale, same as the family LMS (8)
+BC_MU_W = 5              # leaky window (2^5 = 32 hits) of the per-context mean
+BC_MU_RND = 1 << (BC_MU_W - 1)   # round-half-up constant for the mu read-back
+BC_ABS_W = 6             # leaky window (2^6) of the per-channel mean-|e| scale
+BC_NQ1 = 5               # quantizer levels for e[t-1]
+BC_NQ2 = 3               # quantizer levels for e[t-2]
+BC_NCTX = BC_NQ1 * BC_NQ2 * 2    # 30 context buckets (<= 32)
+
+
+def _bc_context(e1, e2, sabs, dpar):
+    """Context index in [0, BC_NCTX) from causally-available data only.
+
+    Thresholds come from the channel's backward leaky mean |e| (T = sabs>>BC_ABS_W,
+    always >= 0), so the quantizer is SCALE-FREE -- a residual counts as "large"
+    relative to the channel's own current activity, not an absolute number:
+        q1(e[t-1]) in 0..4  : < -1.5T, < -0.5T, |.| <= 0.5T, <= 1.5T, > 1.5T
+        q2(e[t-2]) in 0..2  : < -0.5T, within, > 0.5T
+        s          in 0..1  : sign of the PARENT channel's previous coded residual
+    Bootstrap (T = 0) degenerates to plain signs, deterministically and identically
+    on both sides. All integer compares -- no multiplies, no divides."""
+    T = sabs >> np.int64(BC_ABS_W)
+    t1 = T >> np.int64(1)            # 0.5 * mean|e|
+    t2 = T + t1                      # 1.5 * mean|e|
+    q1 = np.full(e1.size, 2, np.int64)
+    q1[e1 < -t1] = 1
+    q1[e1 < -t2] = 0
+    q1[e1 > t1] = 3
+    q1[e1 > t2] = 4
+    q2 = np.ones(e2.size, np.int64)
+    q2[e2 < -t1] = 0
+    q2[e2 > t1] = 2
+    s = (dpar < 0).astype(np.int64)
+    return (q1 * BC_NQ2 + q2) * 2 + s
+
+
+def _bc_forward(x, parents, order=BC_ORDER, shift=BC_SHIFT):
+    """Order-4 sign-sign LMS (stage 1, verbatim rule) + per-context running-mean
+    bias cancellation (stage 2). Returns the CORRECTED residual d that gets Rice-
+    coded. Vectorized over channels; the corrector is a gather/scatter on one
+    accumulator per (channel, context)."""
+    C, N = x.shape
+    x = x.astype(np.int64)
+    par = np.asarray(parents, np.int64)
+    has_par = par >= 0
+    psrc = np.where(has_par, par, 0)           # safe gather index for root channels
+    w = np.zeros((C, order), np.int64)
+    hist = np.zeros((C, order), np.int64)      # past reconstructed samples
+    S = np.zeros((C, BC_NCTX), np.int64)       # per-context leaky bias accumulators
+    sabs = np.zeros(C, np.int64)               # leaky mean-|e| scale (context thresholds)
+    e1 = np.zeros(C, np.int64)                 # raw residual e[t-1]
+    e2 = np.zeros(C, np.int64)                 # raw residual e[t-2]
+    dprev = np.zeros(C, np.int64)              # CODED residual d[t-1] (per channel)
+    res = np.empty((C, N), np.int64)
+    ci = np.arange(C)
+    for t in range(N):
+        pred = (w * hist).sum(axis=1) >> shift
+        e = x[:, t] - pred                      # stage-1 (LMS) residual
+        ctx = _bc_context(e1, e2, sabs, np.where(has_par, dprev[psrc], 0))
+        acc = S[ci, ctx]
+        mu = (acc + BC_MU_RND) >> np.int64(BC_MU_W)     # E[e|ctx], shift-divide
+        d = e - mu                              # stage-2 (bias-cancelled) residual
+        res[:, t] = d
+        # running-mean update on the RAW residual -> mu tracks E[e|ctx] directly
+        S[ci, ctx] = acc + e - (acc >> np.int64(BC_MU_W))
+        # stage-1 adaptation is UNCHANGED: it sees the pre-correction e
+        w += np.sign(e)[:, None] * np.sign(hist)
+        sabs += np.abs(e) - (sabs >> np.int64(BC_ABS_W))
+        e2 = e1
+        e1 = e
+        dprev = d
+        hist[:, 1:] = hist[:, :-1]
+        hist[:, 0] = x[:, t]
+    return res
+
+
+def _bc_inverse(res, parents, order=BC_ORDER, shift=BC_SHIFT):
+    """Exact inverse of _bc_forward. The decoder holds d[t] from the stream, forms
+    the SAME context from data strictly before t, reads the SAME mu, and recovers
+    e = d + mu -- so every table (weights, accumulators, scale) updates identically
+    on both sides from causally-available data. Zero side-info."""
+    C, N = res.shape
+    res = res.astype(np.int64)
+    par = np.asarray(parents, np.int64)
+    has_par = par >= 0
+    psrc = np.where(has_par, par, 0)
+    w = np.zeros((C, order), np.int64)
+    hist = np.zeros((C, order), np.int64)
+    S = np.zeros((C, BC_NCTX), np.int64)
+    sabs = np.zeros(C, np.int64)
+    e1 = np.zeros(C, np.int64)
+    e2 = np.zeros(C, np.int64)
+    dprev = np.zeros(C, np.int64)
+    x = np.empty((C, N), np.int64)
+    ci = np.arange(C)
+    for t in range(N):
+        pred = (w * hist).sum(axis=1) >> shift
+        ctx = _bc_context(e1, e2, sabs, np.where(has_par, dprev[psrc], 0))
+        acc = S[ci, ctx]
+        mu = (acc + BC_MU_RND) >> np.int64(BC_MU_W)
+        d = res[:, t]
+        e = d + mu                              # undo stage 2
+        xt = pred + e                           # undo stage 1
+        x[:, t] = xt
+        S[ci, ctx] = acc + e - (acc >> np.int64(BC_MU_W))
+        w += np.sign(e)[:, None] * np.sign(hist)
+        sabs += np.abs(e) - (sabs >> np.int64(BC_ABS_W))
+        e2 = e1
+        e1 = e
+        dprev = d
+        hist[:, 1:] = hist[:, :-1]
+        hist[:, 0] = xt
+    return x
+
+
+def bcbp_encode(x, cols=16):
+    x = np.asarray(x, np.int64)
+    C, N = x.shape
+    xt, parents, betas = _bp_select(x, cols)     # proven best-partner front-end (verbatim)
+    res = _bc_forward(xt, parents)               # LMS4 + per-context bias cancellation
+    body = b"".join(ec.rice_encode_1d(res[c]) for c in range(C))
+    hdr = struct.pack("<HHII", BC_MAGIC, cols, C, N)
+    side = parents.astype("<i2").tobytes() + betas.astype("<i2").tobytes()
+    return hdr + side + body
+
+
+def bcbp_decode(buf):
+    magic, cols, C, N = struct.unpack_from("<HHII", buf, 0)
+    assert magic == BC_MAGIC, "bad context-bias-cancellation codec magic"
+    off = 12
+    parents = np.frombuffer(buf, "<i2", C, off).astype(np.int64); off += 2 * C
+    betas = np.frombuffer(buf, "<i2", C, off).astype(np.int64); off += 2 * C
+    res = np.empty((C, N), np.int64)
+    for c in range(C):
+        arr, off = ec.rice_decode_1d(buf, off)
+        res[c] = arr
+    xt = _bc_inverse(res, parents)               # matched two-stage inverse
+    x = _bp_inverse(xt, parents, betas)
+    return x.astype(np.int16)
+
+
+# ===========================================================================
 # Uniform codec objects + the registry
 # ===========================================================================
 class Codec:
@@ -3113,6 +3802,239 @@ _register(Codec("LMS4+Rice+xchan_jointbp2", jbp2_encode, jbp2_decode, CodecMeta(
     block_size=JBP2_BLOCK, notes=_JBP2_NOTE), family="cross-channel",
     desc="order-4 LMS + backward-adaptive per-block best-PAIR selection + joint "
          "co-adaptive 2-tap sign-sign LMS spatial predictor (zero side-info) + Rice"))
+
+
+# NEW candidate (this cycle): PROPAGATION-DELAY-ALIGNED rank-1 cross-channel
+# prediction -- the same spatial lever INSIGHTS P1 proves dominant, but with the
+# predictor's support moved in TIME. Per sample-channel the front-end costs the
+# same as any rank-1 subtract (1 mul + 1 shift + 1 sub = _XCHAN_OPS) on top of the
+# order-4 LMS+Rice base (_LMS4_OPS); what grows is the per-block backward SEARCH:
+# <=4 candidate parents x (XLAG_MAXD+1)=9 lags = <=36 scored candidates instead of
+# bestpartner_adaptive's 4, each ~2 macs + Rice-bit scoring amortised over the
+# block (_LMS4BPA_SELECT=10 for 4 -> ~_XLAG_SELECT for 36). At the sEMG regime
+# (1831 cyc/sample-ch) that is roomy; it does NOT fit the tight 30 kHz neural
+# budget as a full joint search -- the staged realization noted below (refine d
+# only for the winning parent, re-search every K blocks, since conduction velocity
+# is slowly varying) is what a neural-rate port would ship. The decoder repeats the
+# identical search from bit-identical reconstructed history, so dec_ops == enc_ops
+# and NOTHING is transmitted. Persistent state: order-4 LMS (24 B) + the D=8
+# int16 lagged parent history the subtract reads (16 B) + the current
+# (parent byte, lag byte, int16 beta) triple (4 B) -> 44 B/ch = 5.6 KB at 128 ch,
+# trivial for STM32H745 SRAM / Spartan-7 BRAM.
+_XLAG_SELECT = 90    # <=4 parents x 9 lags backward scan (~2.5 ops each), amortised/block
+_XLAG_STATE = _LMS4_STATE + 2 * XLAG_MAXD + 4   # LMS4 + D-deep parent lag line + (p,d,beta)
+_XLAG_NOTE = (
+    "propagation-delay-aligned rank-1 cross-channel subtract: EVERY other registered "
+    "front-end (xchan, bestpartner(_adaptive), joint2, jointbp2, acar(_sel)) subtracts "
+    "its parent at LAG ZERO -- same t, elementwise -- which captures only the "
+    "instantaneous/transversal slice of the cross-channel MI. HD-sEMG is dominated by "
+    "MUAPs PROPAGATING along the fibres at ~3-5 m/s, so at 8-10 mm IED and 2048 Hz the "
+    "along-fibre neighbour is a near-replica delayed by ~2-5 samples (~1/4 cycle at the "
+    "~100 Hz peak): a zero-lag subtract sees a PHASE-ROTATED copy and discards that MI. "
+    "The achievable rank-1 gain is set by max_d coherence(c,p;d), not coherence at d=0. "
+    "MECHANISM: for channel c, block i>0, over the PREVIOUS already-reconstructed RAW "
+    "block, scan every (parent p, lag d in 0..8) pair -- p from the same <=4 causal grid "
+    "neighbours as the promoted best (_bp_candidates, all idx<c) -- derive each one's "
+    "integer least-squares gain against the LAG-SHIFTED parent (_bp_opt_beta, verbatim), "
+    "score the cross-residual's estimated Rice bits (_bp_score), also score the "
+    "no-parent option, and keep the min-bits (p,d,beta); apply it to the CURRENT block "
+    "as y[c,t]=x[c,t]-((beta*x[p,t-d])>>shift). d>=0 reads only OLDER parent history, so "
+    "this is strictly MORE causal than the lag-0 incumbents: look-ahead 0. Reconstruction "
+    "is lossless and every candidate parent has grid idx<c, so the decoder re-runs the "
+    "IDENTICAL integer search and the (p,d,beta) triple is NEVER transmitted -> ZERO "
+    "side-info (INSIGHTS P4). Block 0 bootstraps to no-parent (coded as-is). The "
+    "subtract stays strictly RANK-1 (one parent, one gain) -- so it is NOT the P3 "
+    "multi-tap-transform dead end, NOT the retired summed multiparent (nothing to "
+    "double-count), and injects estimation noise only into c's residual while parent rows "
+    "stay clean. Temporal back-end unchanged: order-4 sign-sign LMS + adaptive Rice "
+    "(P2/P5) -- the ONLY variable vs bestpartner_adaptive is the lag axis; XLAG_MAXD=0 "
+    "would reduce this codec exactly to bestpartner_adaptive. It is not a bestpartner "
+    "variant (WHICH parent) nor a joint2/jointbp2 variant (HOW MANY parents): it moves "
+    "the predictor's support in TIME, an axis no registered codec touches. EMBEDDABILITY: "
+    "extra state = D int16/ch lag line (~2 KB at 128 ch); the FULL joint 4x9 search fits "
+    "the roomy sEMG budget but not the 125-cyc neural one -- a neural-rate port stages it "
+    "(refine d only for the winning parent, re-search every K blocks, conduction velocity "
+    "being slowly varying), which the declared enc_ops does NOT assume (conservative). "
+    "FALSIFIABLE: on a transversally mounted array the winning d collapses to 0 and the "
+    "gain vanishes; CapgMyo (differential montage, neighbour |corr| 0.29) is the upside "
+    "test -- a differential montage kills the zero-lag common mode but cannot kill the "
+    "propagation delay. Bases (paper-reported, unverified here): MPEG-4 ALS time-lagged "
+    "multichannel cross-prediction against a selected reference channel (Liebchen et al.); "
+    "conduction velocity estimated by maximizing along-fibre HD-sEMG cross-correlation AT "
+    "A DELAY, XCC 0.7-0.8 at the correct lag (Farina & Merletti; openhdemg); Itiki, Furuie "
+    "& Merletti BioMed Eng OnLine 2014;13:25 on transversal vs longitudinal ordering.")
+_register(Codec("LMS4+Rice+xchan_lag", xlag_encode, xlag_decode, CodecMeta(
+    integer_only=True, enc_ops=_LMS4_OPS + _XCHAN_OPS + _XLAG_SELECT,
+    dec_ops=_LMS4_OPS + _XCHAN_OPS + _XLAG_SELECT,
+    state_bytes_per_ch=_XLAG_STATE, causal=True, lookahead_samples=0,
+    block_size=XLAG_BLOCK, notes=_XLAG_NOTE), family="cross-channel",
+    desc="order-4 LMS + backward-adaptive per-block (parent, LAG, gain) rank-1 "
+         "cross-channel subtract at the propagation delay (zero side-info) + Rice",
+    retired=True,
+    retired_reason="Conclusively Pareto-dominated by LMS4+Rice+xchan_bestpartner_adaptive "
+                   "on ALL 4 real sets -- worse ratio everywhere (hyser 1.4767x vs 1.4770x, "
+                   "otb 2.0923x vs 2.1531x = -2.82%, capgmyo 1.3513x vs 1.3529x, cemhsey "
+                   "1.9534x vs 1.9539x) AND 2.6x the cost (0.0995 vs 0.0387), and it is the "
+                   "only registered codec that fails neural_ok. The 9x larger (parent,lag) "
+                   "hypothesis space is selected from ONE stale 256-sample block, so "
+                   "winner's-curse selection variance exceeds the near-zero extra MI at d>0: "
+                   "neighbour MI in HD-sEMG is carried by the INSTANTANEOUS volume-conducted "
+                   "far field, not by the propagating MUAP component. "
+                   "experiments/015_lms4_rice_xchan_lag.md, cycle 2026-08-13."))
+
+
+# NEW candidate (this cycle): max-MI (CHOW-LIU) SPANNING-TREE channel topology --
+# the same dominant spatial lever (INSIGHTS P1), but changing the parent GRAPH
+# instead of the gain, the parent count, or the time offset. Per sample-channel the
+# subtract costs exactly what any rank-1 front-end costs (1 mul + 1 shift + 1 sub =
+# _XCHAN_OPS) on top of the order-4 LMS+Rice base (_LMS4_OPS); what grows is the
+# per-block backward SCAN: the 8-neighbour edge set gives ~4 incident edges per
+# channel scored in BOTH orientations (~8 scored candidates) vs bestpartner_adaptive's
+# 4 -- so ~2x _LMS4BPA_SELECT -- plus Kruskal/union-find over ~4C edges (~500 at
+# 128 ch), which is <0.05 ops/sample-ch once amortised over the 256-sample block.
+# All weights are integer Rice bit-counts; no float, no division past the rounded
+# integer-LS gain. The decoder repeats the identical search, so dec_ops == enc_ops and
+# NOTHING is transmitted. Persistent state: order-4 LMS (24 B) + parent id + traversal
+# position + the int16 gain (4 B) = 28 B/ch (~3.6 KB at 128 ch). PORT NOTE: the DECODER
+# walks channels in tree order (a permutation -> indirect BRAM addressing on the
+# Spartan-7, cheap but not a linear sweep); the on-node ENCODER is unaffected.
+_XMST_SELECT = 21   # ~4 incident edges x 2 orientations (2 macs + bit-scoring each),
+                    # + Kruskal/union-find over ~4C edges, amortised per block
+_XMST_STATE = _LMS4_STATE + 4   # order-4 LMS + (parent byte, order byte, int16 gain)
+_XMST_NOTE = (
+    "max-MI (Chow-Liu) SPANNING-TREE channel topology: every other registered "
+    "front-end inherits the RASTER-CAUSAL parent set (_bp_candidates offers channel c "
+    "only left/up/up-left/up-right, i.e. the 8-neighbours with index<c) -- a "
+    "restriction that exists only so the decoder can walk channels in INDEX order. It "
+    "discards exactly HALF the 8-neighbourhood (right/down/down-left/down-right), and "
+    "the per-channel GREEDY pick under an arbitrary scan order is not the optimal "
+    "parent structure even among the parents it can see: row 0 has only 'left', column "
+    "0 only up/up-right, and any channel whose strongest correlate lies later in raster "
+    "order is forced onto a strictly weaker parent -- a STRUCTURAL loss, not a tuning "
+    "issue. Chow & Liu (IEEE Trans. IT 14(3):462-467, 1968) prove the maximum-weight "
+    "spanning tree under pairwise-MI edge weights is the tree factorization minimizing "
+    "KL divergence to the true joint -- exactly the entropy-minimizing rank-1 dependency "
+    "structure the current front-end greedily approximates (Gaussian edge weight "
+    "-1/2 log(1-rho^2), so the MST maximizes total removable MI over all trees). "
+    "MECHANISM (backward, zero side-info): candidate graph = the undirected 8-"
+    "neighbourhood of the grid (~4 edges/ch, a bounded ~2x the incumbent's 4 raster "
+    "candidates -- NOT the complete graph; embeddability caps the edge set). For each "
+    "edge, over the PREVIOUS already-reconstructed RAW block, BOTH orientations get the "
+    "integer least-squares gain (_bp_opt_beta, verbatim) and the coded-bit saving in "
+    "estimated Rice bits (_bp_score, verbatim); w(u,v) = max(0,save(u|v)) + "
+    "max(0,save(v|u)) -- a directional coded-bit saving is the operational estimate of "
+    "N*I(u;v), and summing the orientations gives the SYMMETRIC integer stand-in for "
+    "Chow-Liu's MI (clamped at 0, since I>=0). Kruskal + union-find over those integer "
+    "weights (descending weight, ties by (u,v) index) builds the max-weight spanning "
+    "tree; BFS from the lowest-index node of each component roots it and orients edges "
+    "away from the root (rooting is free in Chow-Liu -- any rooting of the same "
+    "undirected tree is the same factorization). One rank-1 subtract per TREE EDGE is "
+    "then applied to the CURRENT block, y[c]=x[c]-((beta*x[parent(c)])>>shift), with "
+    "beta the same previous-block integer-LS gain already scored for that orientation "
+    "(beta=0, channel as-is, when that orientation's saving was <=0; the tree structure "
+    "is unchanged). CAUSALITY: the tree comes only from block i-1, which the decoder "
+    "holds bit-identically (lossless), so it rebuilds the IDENTICAL tree and gains -- "
+    "ZERO side-info, look-ahead 0 (INSIGHTS P4); block 0 bootstraps to no parent, as in "
+    "bestpartner_adaptive. Because a parent may now have a HIGHER index than its child, "
+    "the decoder inverts block i in TREE ORDER (root->leaves), each parent's block-i raw "
+    "samples restored before its children read them. NEW AXIS = the parent GRAPH: vs "
+    "PROMOTED bestpartner(_adaptive) same rank-1 subtract, same integer-LS gain, same "
+    "Rice-bit scoring, but the FULL 8-neighbourhood and a structure globally optimal "
+    "over trees instead of greedy-per-channel under a raster order (restricting the "
+    "graph to the raster half-neighbourhood and forcing index-order traversal collapses "
+    "this back toward bestpartner_adaptive); vs xchan_lag (same cycle) that moves the "
+    "parent in TIME, this moves it in the channel GRAPH -- orthogonal, both rank-1; vs "
+    "joint2/jointbp2 (HOW MANY parents) the subtract stays strictly RANK-1, one parent "
+    "and one gain per channel, so NOT the P3 multi-tap dead end; vs RETIRED "
+    "xchan_multiparent each channel still has exactly ONE parent, so no shared mode is "
+    "double-counted (P1b); vs RETIRED iklt/iklt_adaptive there is no rotation -- the "
+    "subtract is asymmetric, injecting estimation noise only into the child's residual "
+    "while the parent row stays clean (P3 refinement). Temporal back-end UNCHANGED: "
+    "order-4 sign-sign LMS + adaptive Rice (P2/P5). EMBEDDABILITY: ~2x the incumbent's "
+    "per-block selection cost, Kruskal over ~4C edges <0.05 ops/sample-ch amortised, "
+    "integer bit-count comparisons only, ~4 B/ch extra state. PORT NOTE (flagged): "
+    "DECODE follows a tree traversal, so channel access is a PERMUTATION -- indirect "
+    "BRAM addressing on the Spartan-7 (cheap, but not a linear channel sweep); the "
+    "on-node ENCODER is unaffected. FALSIFIABLE: the gain should be largest where the "
+    "raster restriction bites hardest (boundary-heavy geometries, anisotropic "
+    "correlation not aligned with the scan); if each channel's best correlate is already "
+    "inside the raster half-neighbourhood the MST degenerates to the greedy parent set "
+    "and the result is ~0 gain at ~2x selection cost -- a clean negative. Bases "
+    "(paper-reported, unverified here): Chow & Liu 1968; correlation-driven rather than "
+    "geometry-driven channel grouping in biosignals -- 'Efficient lossless multi-channel "
+    "EEG compression based on channel clustering' (Biomed. Signal Process. Control, "
+    "2016) and 'Low-complexity lossless multichannel ECG compression based on selective "
+    "linear prediction' (2019), the latter being the single-parent-selection analogue "
+    "already shipped here, of which the tree is the global-optimality upgrade.")
+_register(Codec("LMS4+Rice+xchan_mst", xmst_encode, xmst_decode, CodecMeta(
+    integer_only=True, enc_ops=_LMS4_OPS + _XCHAN_OPS + _XMST_SELECT,
+    dec_ops=_LMS4_OPS + _XCHAN_OPS + _XMST_SELECT,
+    state_bytes_per_ch=_XMST_STATE, causal=True, lookahead_samples=0,
+    block_size=XMST_BLOCK, notes=_XMST_NOTE), family="cross-channel",
+    desc="order-4 LMS + backward-adaptive per-block max-MI (Chow-Liu) SPANNING-TREE "
+         "channel topology, one rank-1 subtract per tree edge (zero side-info) + Rice"))
+
+
+# NEW candidate (this cycle): CONTEXT BIAS-CANCELLATION -- the TEMPORAL lever
+# (INSIGHTS frontier #2), changing the predictor's FUNCTIONAL FORM by an additive
+# conditional-mean term rather than its tap count or its coefficient-set count (P2).
+# Per sample-channel, on top of the order-4 LMS + rank-1 subtract base
+# (_LMS4_OPS + _XCHAN_OPS) and the incumbent's offline best-partner scan
+# (_BP_SELECT_OPS, unchanged and amortised), stage 2 costs: ~3 shifts/adds for the
+# scale thresholds, ~6 compares to quantize the last two residuals, ~1 to pick up the
+# parent's residual sign, ~3 to combine them into a bucket index (small-constant
+# shifts/adds, NO multiply), 1 table gather, 2 for the rounded shift-divide read of mu,
+# 1 subtract to apply it, 3 to update the accumulator (shift, sub, add) + 1 store, and
+# 3 for the mean-|e| leaky integrator ~= 22 ops. NO multiplies and NO divides anywhere
+# in the corrector -- everything is a shift-divide, which is what makes it cheap in
+# both firmware and RTL. Decoder does the identical work (dec_ops == enc_ops minus the
+# encoder-only partner scan), and NOTHING extra is transmitted: the mu tables are
+# rebuilt from reconstructed history (P4). Persistent state: order-4 LMS (24 B) +
+# 30 int32 context accumulators (120 B) + the mean-|e| accumulator (4 B) + e[t-1],
+# e[t-2] (8 B as int32) + this channel's own d[t-1] (4 B) = 160 B/ch on top of the
+# best-partner bookkeeping (_BP_STATE) -> ~21 KB at 128 ch, ~8% of the SRAM budget.
+_BC_XTRA = 22          # context formation + mu read/apply/update, shift-divide only
+_BC_STATE = _LMS4_STATE + BC_NCTX * 4 + 4 + 8 + 4   # LMS4 + mu tables + scale + e1/e2/d
+_BC_NOTE = (
+    "TWO-STAGE PREDICTOR: stage 1 is the promoted order-4 sign-sign LMS, bit-identical "
+    "to LMS4+Rice+xchan_bestpartner (same taps, same +-1 sign-sign update, fed the "
+    "PRE-correction residual e on both sides); stage 2 subtracts a per-context running "
+    "mean mu[c,ctx] of e before Rice-coding, d = e - mu. THEORY: a linear predictor "
+    "whitens only to second order, and sign-sign LMS is not even MMSE-optimal -- it "
+    "descends a sign-gradient criterion whose fixed point is offset from the Wiener "
+    "solution and whose constant +-1 steps never settle, so the residual retains a "
+    "persistent context-dependent NON-ZERO CONDITIONAL MEAN. H(e) >= H(e - E[e|ctx]) "
+    "and the second moment drops by E[mu_ctx^2], shortening the Rice code by about "
+    "1/2*log2(1 + E[mu^2]/sigma^2) bits/sample -- the same mechanism that gives "
+    "JPEG-LS/LOCO-I its measurable gain over bare MED, and CALIC its context error "
+    "feedback (Weinberger, Seroussi & Sapiro; Wu & Memon -- paper-reported, unverified "
+    "here). CONTEXT (30 buckets <= 32): q5(e[t-1]) x q3(e[t-2]) x sign(d[parent,t-1]), "
+    "with quantizer thresholds at 0.5x and 1.5x the channel's BACKWARD leaky mean |e| "
+    "so the buckets are scale-free across bursts and quiescence; the parent bit is at "
+    "LAG 1 so the sample update stays one vectorized channel sweep with no intra-sample "
+    "channel chain. ESTIMATOR: leaky integrator S += e - (S>>5), mu = (S+16)>>5 -- "
+    "shift-divide only, no multiply, no divide, no counter reset. NOT A RETIRED LEVER: "
+    "vs RETIRED xctx (cycle 9), which conditioned the RICE PARAMETER k on a "
+    "cross-channel energy context and lost because adaptive-k already tracks scale and "
+    "the model is pure loss (P5) -- here the CODER IS UNTOUCHED (one global adaptive-"
+    "Rice back-end, no context-split tables, no k model) and what is conditioned is a "
+    "FIRST MOMENT of the residual UPSTREAM of the coder; vs RETIRED LMS4rs (cycle 14), "
+    "which forked WHOLE COEFFICIENT SETS by activity regime and lost by fragmenting "
+    "adaptation and fitting noise (P2) -- here there is exactly ONE global predictor "
+    "and ONE weight set adapting on every sample, the context indexing only a single "
+    "scalar mean, the cheapest statistic there is. SPATIAL FRONT-END UNCHANGED: "
+    "_bp_select/_bp_inverse reused verbatim, identical (parent,beta) side-info. "
+    "HONEST RISK: P5 measured the post-LMS residual near-white, so E[mu^2]/sigma^2 may "
+    "be tiny while the estimator itself injects ~sigma^2/2^5 of variance per bucket -- "
+    "a null or small negative is a real possible outcome and would show the sign-sign "
+    "misadjustment leaves no exploitable conditional mean.")
+_register(Codec("LMS4bc+Rice+xchan_bestpartner", bcbp_encode, bcbp_decode, CodecMeta(
+    integer_only=True, enc_ops=_LMS4_OPS + _BC_XTRA + _XCHAN_OPS + _BP_SELECT_OPS,
+    dec_ops=_LMS4_OPS + _BC_XTRA + _XCHAN_OPS,
+    state_bytes_per_ch=_BC_STATE + _BP_STATE, causal=True, lookahead_samples=0,
+    block_size=ec.BLOCK, notes=_BC_NOTE), family="temporal",
+    desc="order-4 LMS + JPEG-LS-style per-context running-mean bias cancellation "
+         "(30 buckets, zero side-info) + Rice, under the best-partner front-end"))
 
 
 def list_codecs(include_retired=False):
