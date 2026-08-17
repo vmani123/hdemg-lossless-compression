@@ -9,41 +9,50 @@ the append-only cross-cycle ledger is `CYCLE_LOG.md`, and the durable *why* is
 proves (short version: the headline `+xchan` ratios are measured with an offline
 whole-signal beta; the on-node figure is the backward-adaptive variant's).
 
-_Last updated after cycle 2026-07-22 (15 codecs benched, 9 retired). All four real
-sets benched at 15 000 samples: `results/06_real_bench*.csv`._
+_Last updated after the 2026-08-17 consolidation of five cycles
+(2026-08-05 → 2026-08-16) that ran in parallel, blind to each other, and were
+merged into one PR (see `CYCLE_LOG.md` rows 16–30 for the full per-cycle
+detail and the naming-collision/duplicate-mechanism resolution notes). 27
+codecs benched (11 retired), all four real sets at 15 000 samples:
+`results/consolidated_bench.csv`._
 
-## Best embeddable: `LMS4+Rice+xchan_bestpartner` (cost 0.039)
+## Best: `LMS4bc+Rice+xchan_bestpartner` (cost 0.120)
 
-Order-4 sign-sign LMS + adaptive Golomb-Rice, per-channel best-of-4 causal-neighbour
-cross-channel subtract. Best embeddable on **every** real set; only offline LZMA is ahead.
+Order-4 sign-sign LMS + best-of-4 causal-neighbour cross-channel subtract +
+a JPEG-LS/CALIC-style backward-adaptive per-context running-mean bias
+corrector (30 buckets, divisionless, zero side-info) applied to the residual
+before Rice coding. Beats the prior best on 3 of 4 real sets (CEMHSEY is a
+−0.02% dead tie); only offline LZMA is ahead on Hyser/CEMHSEY.
 
-| dataset | ch | best-emb ratio | %-of-FLAC | FLAC | best offline ref |
+| dataset | ch | best ratio | %-of-FLAC | FLAC | best offline ref |
 |---|--:|--:|--:|--:|---|
-| **hyser_1dof_f1_s1** (primary) | 128 | **1.480×** | 151% | 0.98× | lzma 1.67× |
-| otb_hdsemg_vl | 64 | **2.162×** | 176% | 1.23× | wavpack 1.85× (emb-class) |
-| cemhsey_s1_d1t1 | 320 | **1.956×** | 167% | 1.17× | lzma 2.06× |
-| capgmyo_dba_s1 | 128 | **1.350×** | 137% | 0.98× | wavpack 1.35× |
+| **hyser_1dof_f1_s1** (primary) | 128 | **1.4851×** | 152% | 0.98× | lzma 1.67× |
+| otb_hdsemg_vl | 64 | **2.1934×** | 179% | 1.23× | — (beats every offline ref) |
+| cemhsey_s1_d1t1 | 320 | **1.9553×** (or 1.970× via `_lite`) | 168% | 1.17× | lzma 2.06× |
+| capgmyo_dba_s1 | 128 | **1.3638×** (via `xlag` corner) | 139% | 0.98× | — |
 
 ### Primary — real Hyser reference bar
 
-| codec | ratio | embedded_ok | note |
-|---|---:|:--:|---|
-| lzma | 1.67× | ref | **offline**, not embeddable |
-| **LMS4+Rice+xchan_bestpartner** | **1.480×** | ✅ | **best embeddable** (offline selection — see below) |
-| LMS+Rice+xchan_joint2 | 1.493× | ✅ | zero-side-info joint 2-parent; wins Hyser, regresses OTB |
-| zstd-19 | 1.44× | ref | offline |
-| mtscomp | 1.41× | ref | neuro per-channel reference |
-| wavpack | 1.34× | ref | best embeddable-class per-channel ref |
-| LMS+Rice | 1.33× | ✅ | temporal only (no cross-channel) |
-| flac | 0.98× | ref | target to beat (expands here) |
+| codec | ratio | cost | embedded_ok | note |
+|---|---:|---:|:--:|---|
+| lzma | 1.67× | — | ref | **offline**, not embeddable |
+| **LMS4bc+Rice+xchan_bestpartner** | **1.4851×** | 0.120 | ✅ | **new best** (30-ctx bias corrector) |
+| LMS4bc_lite+Rice+xchan_bestpartner | 1.4835× | 0.098 | ✅ | 27-ctx sibling; cheaper, wins CapgMyo+CEMHSEY instead |
+| LMS4+Rice+xchan_bprank | 1.4952× | 0.055 | ✅ | wins Hyser alone but below both its own branches on 3/4 sets — not robust |
+| LMS4+Rice+xchan_jointbp2 | 1.497× | 0.047 | ✅ | max-Hyser corner (unchanged) |
+| LMS4+Rice+xchan_mst | 1.4823× | 0.046 | ✅ | Chow-Liu spatial structure; cheapest improvement over plain best-partner |
+| LMS4+Rice+xchan_bestpartner | 1.4804× | 0.039 | ✅ | prior best; minimal-hardware pick |
+| zstd-19 | 1.44× | — | ref | offline |
+| wavpack | 1.34× | — | ref | best embeddable-class per-channel ref |
+| flac | 0.98× | — | ref | target to beat (expands here) |
 
-- Beats every embeddable-feasible reference (WavPack, mtscomp, even offline zstd-19)
-  at a fraction of the compute, bit-exact. **Achieved cross-channel gain +11.3%** on
-  Hyser (LMS 1.330× → 1.480×) — the dominant lever.
-- Max real ratio 2.162× ≪ the 6× sanity ceiling → honest broadband EMG.
-- Cross-channel gain **tracks real spatial redundancy**: strong where neighbour |corr|
-  is 0.73–0.79 (Hyser/OTB/CEMHSEY), ~0 on CapgMyo (|corr| 0.29). CapgMyo is the negative
-  control — the harness reports gain only where the signal carries it.
+- **Achieved cross-channel + bias gain on Hyser: +11.5%** over `LMS+Rice`
+  (1.332× → 1.4851×); cross-channel decorrelation remains the dominant term
+  (P1), the bias corrector adds a further +0.3–1.5% on top (P9).
+- Max real ratio 2.19× ≪ the 6× sanity ceiling → honest broadband EMG.
+- **No single codec wins all 4 real sets** for the first time — the front is
+  genuinely multi-cornered: `LMS4bc` (Hyser/OTB), `LMS4bc_lite` (CapgMyo tie
+  /CEMHSEY), `xlag` (CapgMyo outright max 1.3638×, but fails `neural_ok`).
 
 ## Pareto front (ratio vs cost, embedded_ok only — real Hyser)
 
@@ -51,15 +60,19 @@ cross-channel subtract. Best embeddable on **every** real set; only offline LZMA
 |---|---:|---:|:--:|---|
 | delta+Rice+xchan | 1.453× | 0.016 | ✅ | cheapest embeddable with xchan (fixed predictors only) |
 | `lms4s7+x6/b512` (search pick) | 1.478× | 0.027 | ✅ | best **value/minimal-hardware** (single parent, zero partner side-info) |
-| LMS+Rice+xchan_joint2 | 1.493× | 0.037 | ✅ | zero-side-info joint 2-parent (wins Hyser only) |
-| LMS4+Rice+xchan_bestpartner | 1.480× | 0.039 | ✅ | **best-ratio robust across all 4 sets** (best-of-4 partner) |
+| LMS4+Rice+xchan_mst | 1.4823× | 0.046 | ✅ | cheapest front-end improvement over plain best-partner (P8) |
+| LMS4+Rice+xchan_bestpartner | 1.4804× | 0.039 | ✅ | robust across all 4 sets, minimal-hardware ceiling |
+| LMS4bc_lite+Rice+xchan_bestpartner | 1.4835× | 0.098 | ✅ | wins CapgMyo+CEMHSEY (P9) |
+| **LMS4bc+Rice+xchan_bestpartner** | **1.4851×** | 0.120 | ✅ | **best ratio** — wins Hyser+OTB (P9) |
 
 ### What mattered (search ablation from best, real Hyser)
 | axis | Δ ratio | |
 |---|---:|---|
 | cross-channel on→off | **+10.8%** | dominant lever, ~70× everything else |
+| per-context bias correction on→off | **+0.3–1.5%** | new second lever (P9), temporal axis |
 | lms order 4→8 | +0.15% | deeper temporal prediction *hurts* here |
 | rice block 512→256 | +0.13% | marginal |
+| lag search (any width) | **−0.25% to −1.30%** | net-negative on monopolar arrays, 5x replicated (P6/P7) |
 
 ### Cross-channel gain vs. spatial correlation (synthetic sweep — mechanism only)
 | spatial-corr | 0.0 | 0.3 | 0.6 | 0.9 |
@@ -71,21 +84,32 @@ set's real neighbour correlation.
 
 ## → The one codec to port next
 
-**`LMS4+Rice+xchan_bestpartner`** for max ratio, or **`lms4s7+x6/b512`** (single
-grid-parent, order-4) for minimal hardware / zero partner side-info — essentially
-tied on ratio (Hyser+OTB mean within +0.04%).
+**`LMS4bc+Rice+xchan_bestpartner`** for max ratio (3× the incumbent's cost for
++0.3–1.5% ratio), **`LMS4+Rice+xchan_mst`** for the best cheap upgrade over the
+prior best (cost 0.046, +0.1–0.4% on 3/4 sets), or **`LMS4+Rice+xchan_bestpartner`**
+/ **`lms4s7+x6/b512`** for minimal hardware — pick by SRAM/compute budget, not by
+ratio alone (`embedded_ok` is a hard gate, never rank on ratio in isolation).
 
-- The essential component is the **cross-channel grid-neighbour front-end** (+10.8–17.4%
-  where redundancy exists); the temporal predictor can be as small as order-4. If minimal
-  hardware is paramount, `delta+Rice+xchan` (Hyser 1.45×, cost 0.016, fixed predictors only)
-  is 98% of the best ratio.
-- **Port caveat (real):** the best-partner *selection* + beta are currently derived
-  **offline over the whole signal** — the reported ratio is **not** from an on-node
-  encoder (see `EMBEDDED_OK_VERIFICATION.md`, `embedded_verify.py`). The streaming
-  realization is **`LMS4+Rice+xchan_bestpartner_adaptive`**: per-block backward
-  re-selection from the previous reconstructed block, **zero side-info, look-ahead 0**,
-  holding the offline ratio within ~0.4% (and beating it on CapgMyo). **Port that one**
-  if the offline selection is unacceptable on-node.
+- The essential component remains the **cross-channel grid-neighbour front-end**
+  (+10.8–17.4% where redundancy exists); the bias corrector (P9) adds a further,
+  smaller +0.3–1.5% on top and is the first positive result on the temporal axis
+  since the predictor order/coefficient-count/quadratic-form levers closed (P2).
+  If minimal hardware is paramount, `delta+Rice+xchan` (Hyser 1.45×, cost 0.016,
+  fixed predictors only) is still ~98% of the pre-bias-corrector ratio.
+- **Port caveat (real), unchanged:** the best-partner *selection* + beta underlying
+  every codec on this page are still derived **offline over the whole signal** —
+  see `EMBEDDED_OK_VERIFICATION.md`. The streaming realization is
+  **`LMS4+Rice+xchan_bestpartner_adaptive`**: per-block backward re-selection,
+  **zero side-info, look-ahead 0**, holding the offline ratio within ~0.4%. The
+  bias-corrector stage itself is already fully backward-adaptive / zero side-info
+  in both `LMS4bc` variants — only the front-end they sit on carries the caveat.
+- **Branch-hygiene note for future cycles:** this leaderboard update exists
+  because five consecutive automated cycles (2026-08-05 → 2026-08-16) each
+  branched from the same stale `main` instead of from the latest unmerged PR,
+  so none could see another's work — see `CYCLE_LOG.md`'s consolidation note
+  above rows 16–30. Future cycles should rebase onto the latest merged `main`
+  (not just re-fetch it) before surveying, and this repository's operators
+  should merge each cycle's PR before the next cycle starts wherever practical.
 
 ## Status vs. the 6-stage plan
 All stages complete: registry + cost model, real corpus (Hyser/OTB/CEMHSEY-320/CapgMyo,
