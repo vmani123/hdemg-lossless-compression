@@ -41,6 +41,18 @@ cost-efficient corner worth knowing: `LMS4+Rice+xchan_mst` (Chow-Liu spanning
 tree spatial front-end, cost 0.046) beats the plain best-partner front-end on
 3 of 4 real sets for barely more than its cost (P8).
 
+**Update 2026-08-19 — the headline's strongest challenger.** A third bias
+corrector, `LMS4bcxs+Rice+xchan_bestpartner` (27 buckets like `bc_lite`, but
+conditioned on a **cross-channel gradient** instead of own-channel history),
+now holds the **best 4-set real mean of any codec ever benched here — 1.74788×
+at cost 0.1013**, versus the headline's 1.74673× at 0.1202 (16% cheaper).
+Real ratios: Hyser 1.484874×, OTB 2.181863×, CapgMyo 1.353163×, **CEMHSEY
+1.971616× (an outright maximum)** — `results/cycle_bench.csv`. It was **not**
+promoted: against `LMS4bc` it is 1 clear win (CEMHSEY +0.837%), 1 clear loss
+(OTB −0.528%) and 2 dead ties, which is not "beats the best on real data" under
+the bar this log has applied since cycle 11. It is the obvious headline
+challenger for the next cycle and is on the mean-real Pareto front (P9).
+
 ## Established principles (proven on real HD-sEMG)
 
 ### P1 — Cross-channel spatial decorrelation is the dominant lever, bounded by real neighbour correlation.
@@ -222,11 +234,38 @@ materially stronger evidence than a single cycle's finding.**
   `xctx` (which conditioned the *Rice parameter*, a P5-closed lever, and left
   the residual stream itself untouched) — here the residual stream itself is
   corrected, upstream of the coder.
-- **Implication:** the temporal axis has one more live lever after all:
-  context granularity/cost of the bias corrector is now the open knob (30 vs
-  27 contexts moves cost 22% for a small, real, dataset-dependent ratio
-  shift) — worth a follow-up sweep of context definitions before calling it
-  closed.
+- **Refined 2026-08-19 — the useful axis is the context's *class*, not its
+  count, and its value is bounded by the same neighbour MI as P1.** A third
+  corrector (`LMS4bcxs`) holds bucket count, update law, bitstream format and
+  every other stage **byte-identical to `bc_lite`** and changes only the
+  conditioning variables, from own-channel temporal history to a **cross-channel
+  gradient**: `ctx = (sgn(e[g−1,t] − e[g−cols,t]), sgn(e[parent(g),t]),
+  sgn(e[g,t−1]))`. Isolated effect of making the context cross-channel
+  (`bcxs` − `bc_lite`, `results/cycle_bench.csv`): **+0.090 pp Hyser, +0.067 pp
+  OTB, +0.082 pp CEMHSEY, −0.045 pp CapgMyo**. The sign tracks neighbour mutual
+  information exactly — positive on all three arrays where cross-channel MI
+  exists, **negative on the one array (CapgMyo, differential, xchan lever only
+  +1.4%) where it does not**. The bias stage as a whole is worth **+0.303%
+  Hyser / +0.922% OTB / +0.199% CapgMyo / +0.822% CEMHSEY** over the identical
+  bias-free pipeline — the largest bias-stage contribution measured on OTB and
+  CEMHSEY of the three correctors.
+- **Theory for the refinement:** a context helps in proportion to
+  `I(e_c ; ctx)` and hurts in proportion to how much it fragments each bucket's
+  sample count. The own-channel axis is the one the temporal predictor has
+  already whitened (P5's mechanism), so own-channel history is a *weak* index
+  of the residual bias; the spatial gradient sign is a local-activity-direction
+  indicator drawn from the axis that still carries MI (P1). Where that MI is
+  absent, two of the three context dimensions are noise: 27 buckets do the work
+  of 3, each leaky mean is estimated from ~1/9 as many samples, and the
+  estimation-variance cost shows up as a real loss. **Context relevance is
+  bought with context dilution; the exchange rate is the array's neighbour
+  correlation.** Count (27 vs 30) moved cost 22% for a small dataset-dependent
+  shift; *class* moved ratio further, at essentially equal cost.
+- **Implication:** stop sweeping bucket *counts*; sweep context *classes*, and
+  gate a spatial context on a decoder-observable proxy for neighbour
+  correlation (the `acar_sel` zero-side-info gate discipline, P1/P4) so the
+  low-MI arrays keep the temporal context. That single gate is the cheapest
+  remaining path to a codec that beats `LMS4bc` on all four real sets.
 
 ### P10 — Reversing the pipeline (temporal-then-spatial) is conclusively worse than spatial-then-temporal.
 - **Evidence:** two independent implementations of the reordered pipeline
@@ -244,37 +283,125 @@ materially stronger evidence than a single cycle's finding.**
   any future refinement to either stage should assume this ordering rather
   than re-litigate it.
 
+### P11 — Two-sided (quincunx/HINT) spatial prediction loses to one-sided *gain-fitted* prediction: on real arrays, amplitude tracking beats geometric symmetry.
+- **Evidence:** `LMS4+Rice+xchan_hint` splits the grid into a checkerboard,
+  codes the black half with the incumbent's own best-partner subtract
+  (restricted to same-parity parents), then predicts every white channel from
+  **both** sides with a convex, sum-to-one, shift-only mean — zero side-info on
+  the white half, half the incumbent's on the black. It **lost on all four real
+  sets**: Hyser 1.458679× (−1.47% vs the incumbent front-end), OTB 2.115166×
+  (−2.16%), CapgMyo 1.314593× (−2.66%), CEMHSEY 1.878935× (−3.92%). Isolated
+  cross-channel gain vs the shared `LMS+Rice` null is **below the one-sided
+  incumbent on every real set** — Hyser +9.68% vs +11.31%, OTB +15.88% vs
+  +18.44%, CEMHSEY +8.65% vs +13.08%, and CapgMyo **−1.33% vs +1.37%**, i.e.
+  *worse than having no spatial stage at all*. And the tell: it is the
+  **top-ranked codec on both synthetic sets** (sc0.6 2.636577×, sc0.9
+  2.615727×), beating everything it loses to on real data.
+- **Theory:** two effects, both bounded by information, not by geometry.
+  (i) A convex sum-to-one interpolator is a **unity-gain** predictor: it assumes
+  the neighbour's amplitude equals the target's. That is true of a smooth
+  stationary synthetic field and false of real HD-sEMG, where electrode
+  impedance, distance to the innervation zone and anisotropic conduction make
+  the neighbour amplitude ratio a real, per-pair, time-varying parameter. The
+  incumbent's fitted integer-LS `β` removes exactly that component; the
+  two-sided mean leaves it in the residual. **Prediction-variance reduction
+  from a second, symmetric sample cannot pay for the bias introduced by
+  mis-specifying the gain.** (ii) The parity split deletes every dist-1
+  orthogonal edge from the black half's candidate set — precisely the
+  highest-MI edges, since volume-conducted coherence decays with
+  inter-electrode distance — so half the array is predicted from strictly
+  weaker parents. Note this is *not* the retired `xchan_multiparent` failure
+  (total gain is exactly 1, so it structurally cannot over-subtract); it is the
+  **fixed-basis** failure of P3 transposed from the rotation angle to the gain.
+- **Implication:** the *sidedness* axis is closed. Two-sided spatial prediction
+  is only worth revisiting in a form that keeps a **fitted per-pair gain** on
+  both sides (i.e. a jointly-solved two-parent subtract, P1b, which already
+  works) — never as a fixed-weight interpolator. Second, methodological:
+  **a codec that wins the synthetics and loses the real sets is diagnosing its
+  own basis mismatch.** Synthetic-set leadership is now a documented warning
+  sign, not encouragement.
+
+### P12 — The sign-sign LMS is TRACKING-limited, not misadjustment-limited: annealing the step size is a dead lever, and this closes the last free parameter of the temporal predictor.
+- **Evidence:** `LMS4vs+Rice+xchan_bestpartner` keeps order 4, one coefficient
+  set, the update *direction*, the spatial front-end and the Rice back-end
+  identical, and changes only the step **size**: a per-tap 4-bit saturating
+  gradient-sign-agreement counter selects a power-of-two step, shifts only,
+  zero side-info, constructed so its coarsest step *is* the incumbent's constant
+  ±1 and it can only anneal downward from there. Result: **loses 3 of 4 real
+  sets** (Hyser 1.479529× −0.058%, OTB 2.155639× −0.291%, CapgMyo 1.347197×
+  −0.243%) with CEMHSEY a +0.0036% dead tie, at +31% cost (0.0516 vs 0.0394) —
+  while **winning both synthetics** (+0.018%, +0.020%). Step-shift occupancy was
+  near-uniform across all four levels, so the mechanism genuinely engaged; this
+  is not a null implementation.
+- **Theory:** steady-state excess MSE of sign-sign LMS scales *with* the step,
+  while tracking lag against a time-varying optimum scales *inversely* with it —
+  a single trade with one crossing point. The sign flip between stationary
+  synthetic (annealing wins) and real HD-sEMG (annealing loses on every set)
+  locates the incumbent on the **tracking-limited** side: real HD-sEMG is
+  strongly non-stationary at the block scale (MUAP bursts, recruitment /
+  derecruitment, tens-of-ms amplitude modulation), so every bit of step
+  reduction costs more in lag-induced prediction error than it recovers in
+  gradient noise. The constant ±1 is not an untuned hyperparameter with headroom;
+  it is at or past the optimum for this signal class.
+- **Implication:** read together with P9, this **partitions the post-LMS residual's
+  excess entropy**: it is a context-conditional **first moment** (a bias — live,
+  removable, worth +0.3…+0.9% via P9's corrector) and **not** a step-size
+  **variance** term. Predictor-variance reduction and predictor-bias removal are
+  not substitutes here; only bias is live. The temporal predictor's free
+  parameters are now all spent — order (P2), coefficient-set count (P2),
+  functional form (`LMS4v2`, retired), and step-size rule (this) — so **the
+  temporal axis is closed except for what sits downstream of the predictor**
+  (P9's context-conditional correction).
+
 ---
 
 ## Open frontier (ranked by expected payoff/cost)
 
-_Re-ranked 2026-08-17 after consolidating five parallel cycles. Frontier #2
-(temporal functional form) is **ACHIEVED** — the bias corrector (P9) is now
-the leaderboard best — so it drops off this list. P7's winner's-curse finding
-now explains WHY frontier #1 (scale-gating) has repeatedly under-delivered
-across three independent attempts (P7); it is re-ranked down accordingly._
+_Re-ranked 2026-08-19. Old frontier #1 ("tune the bias corrector's context
+definition") is **spent as stated but reopened one level up**: the cycle proved
+the productive variable is the context's **class**, not its bucket count (P9
+refinement) — so it returns as #1 in gated form, with a specific construction
+rather than a sweep. Old #3 (non-linear temporal predictor) is **downgraded**:
+P12 closed the last free parameter of the temporal predictor and showed the
+residual's remaining excess entropy is a bias, not a variance, term — a new
+functional form is now betting against two independent negatives (`LMS4v2`,
+`LMS4vs`). One lever was spent negative this cycle with nothing suggested in
+return (sidedness, P11)._
 
-1. **Tune the bias corrector's context definition** (P9): the two independently
-   discovered context schemes (27 sign-history buckets vs. 30 quantized-magnitude
-   buckets) land on genuinely different points of a cost/ratio/per-dataset
-   trade-off surface that has not been swept — only two of presumably many
-   viable context definitions have been tried. **Highest payoff, lowest
-   mechanism risk** — the mechanism is proven, this is a hyperparameter sweep
-   on a working lever, not a new bet.
-2. **Scale-gate the spatial front-end** (P1b/P8): the payoff ceiling is now
-   better understood — P7 shows any backward-selected gate (tried 3 ways at 3
-   granularities) tends to land at or below the max of its own branches, so a
-   4th gating attempt should budget for a **null or small result**, not assume
-   the ceiling is the branches' peak. If pursued, gate `LMS4+Rice+xchan_mst`
-   (P8's tight-array winner) against the plain best-partner front-end on
-   decoder-observable channel count, matching the already-proven `acar_sel`
-   zero-side-info gate discipline (P1/P4) — do not add a 4th learned/estimated
-   gate criterion (P7's dead end).
-3. **A genuinely non-linear temporal predictor** (P2/P5, unchanged): still the
-   only completely untouched axis — P9 added a context-conditioned *additive
-   mean* correction, which is a first moment, not a change to the predictor's
-   functional form itself. Medium payoff, higher risk, lowest priority of the
-   three given #1's low-risk headroom.
+1. **MI-gate the bias corrector's context class** (P9 refinement + P1 + P4):
+   `bcxs`'s cross-channel context wins on all three high-neighbour-MI arrays and
+   loses only on the low-MI negative control, by −0.045 pp. A codec that selects
+   the spatial context where neighbour correlation is high and falls back to
+   `bc_lite`'s temporal context where it is not should hold `bcxs`'s CEMHSEY /
+   Hyser / OTB numbers **and** `bc_lite`'s CapgMyo number — which would beat
+   `LMS4bc` on all four real sets and take the headline at ~16% less cost. The
+   gate must be **decoder-observable and zero-side-info** — a backward
+   neighbour-correlation statistic from the previous reconstructed block, or the
+   channel count / array geometry as `acar_sel` already does — and must be a
+   **fixed threshold, not a learned per-block argmin** (P7). Highest payoff,
+   lowest mechanism risk: both branches are already measured and both mechanisms
+   are proven; only the switch is new.
+2. **Recover the OTB half of the split** (P9 + P1b): `bcxs`'s only genuine loss
+   is OTB −0.528% against `LMS4bc`'s 30 quantized-**magnitude** buckets, while
+   its wins come from **sign**-class contexts. Magnitude and sign are
+   complementary statistics of the same residual (they index different moments),
+   and OTB is the tight 64-ch array where P1b says the spatial MI is essentially
+   rank-1 — so a context mixing one spatial-sign slot with one quantized-magnitude
+   slot at the *same* 27–30 bucket budget is a cheap, single-variable test of
+   whether the two correctors' wins are additive or substitutes. Medium payoff,
+   low risk, no new state.
+3. **Scale-gate the spatial front-end** (P1b/P8, carried over, unchanged rank):
+   gate `LMS4+Rice+xchan_mst` (P8's tight-array winner) against the plain
+   best-partner front-end on decoder-observable channel count, matching the
+   proven `acar_sel` discipline — but budget for a **null or small result**: P7
+   shows backward-selected gates (3 attempts, 3 granularities) tend to land at
+   or below the max of their own branches. Do not add a 4th learned/estimated
+   gate criterion.
+
+**No longer on the frontier:** temporal predictor internals of any kind — order,
+coefficient-set count, functional form, step-size rule are all spent (P2, P12).
+Sidedness of the spatial parent set is spent negative (P11). The entropy
+back-end has been closed since P5.
 
 ## Dead ends — do NOT re-propose (a genuinely different variant must say why)
 
@@ -300,6 +427,25 @@ across three independent attempts (P7); it is re-ranked down accordingly._
 - **Temporal-then-spatial pipeline order**, any implementation (P10): the LMS
   high-pass destroys the shared low-frequency mode the cross-channel stage needs,
   confirmed by 2 independent implementations losing on every real set.
+- **Two-sided / quincunx / HINT spatial prediction with FIXED (unity, convex,
+  sum-to-one) weights** (`xchan_hint`, P11): geometric symmetry does not
+  compensate for mis-specifying the neighbour amplitude ratio, and the parity
+  split starves half the array of its highest-MI dist-1 orthogonal parents. Lost
+  on all 4 real sets (−1.47…−3.92%) while topping both synthetics — the
+  signature of a basis matched to a stationary field, not to real HD-sEMG. Only
+  a *fitted-gain* two-sided form (i.e. the joint 2-parent solve, P1b) is still
+  open.
+- **Step-size / adaptation-law tuning of the sign-sign LMS**, any schedule
+  (`LMS4vs`, P12): the predictor is tracking-limited on real non-stationary
+  HD-sEMG, so annealing trades a real tracking loss for a misadjustment gain
+  that isn't there. Wins the stationary synthetics, loses 3/4 real sets at +31%
+  cost. Together with P2 and `LMS4v2` this closes **every** free parameter of
+  the temporal predictor itself.
+- **Sweeping the bias corrector's BUCKET COUNT** (P9 refinement): 27 vs 30
+  buckets moves cost 22% for a small dataset-dependent shift; the productive
+  variable is the context's **class** (which variables condition it), and its
+  value is bounded by the array's neighbour MI. Propose a new context *class*
+  with a gate, never a new count.
 
 ## Sanity anchors
 - Real embeddable ratios on HD-sEMG live in **~1.3–2.2×**. Any lossless ratio **> ~6×** on

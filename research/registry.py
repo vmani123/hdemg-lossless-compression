@@ -3015,6 +3015,184 @@ def biasbp_decode(buf):
     x = _bp_inverse(xt, parents, betas)
     return x.astype(np.int16)
 
+
+# ===========================================================================
+# NEW candidate: CROSS-CHANNEL-GRADIENT CONTEXT for the proven bias corrector
+# (LMS4bcxs+Rice+xchan_bestpartner) -- `bcxs`.
+# ---------------------------------------------------------------------------
+# This changes EXACTLY ONE THING versus the shipped LMS4bc_lite: the CLASS of
+# conditioning variables the JPEG-LS (B, N, C) bias-cancellation machinery is
+# indexed by. The machinery itself -- _bias_new_state, _bias_update, the
+# divisionless counter-halving at N=64, the int8 clamp, 27 buckets, zero
+# side-info -- is reused VERBATIM (literally the same two functions). Only the
+# context word changes, from OWN-CHANNEL TEMPORAL history to CO-LOCATED SPATIAL
+# RESIDUAL GRADIENTS taken from the SAME TIME SLICE:
+#
+#     ctx = ( sgn( e[left(g), t] - e[up(g), t] ),      <- spatial gradient
+#             sgn( e[parent(g), t] ),                  <- 2nd (unused) parent MI
+#             sgn( e[g, t-1] ) )                       <- one temporal anchor
+#           -> 3 x 3 x 3 = 27 buckets
+#
+# left(g) = g-1 (same electrode row) and up(g) = g-cols (same column) are both
+# index < g, and parent(g) < g by best-partner construction, so ALL THREE are
+# already fully reconstructed when the decoder reaches channel g inside the same
+# time slice -- exactly the ordering _bias_forward already relies on, so no new
+# ordering machinery is needed. Off-grid neighbours contribute 0 (graceful edge
+# degradation, identical on both sides). The residuals used are the PRE-
+# correction LMS residuals e, which the decoder has restored for every row < g.
+#
+# THEORY. Wu & Memon, "Context-based lossless interband compression -- extending
+# CALIC", IEEE TIP 9(6):994-1001, 2000 (paper-reported, unverified here) show
+# that context modelling of the PREDICTION-ERROR FIELD captures higher-order
+# interband correlation that a linear interband predictor cannot reach. Our
+# best-partner front-end IS exactly such a linear interband predictor: it removes
+# only the rank-1, scalar-gain, linear projection onto ONE neighbour. What
+# survives is (a) dependence on the neighbours that projection never used --
+# INSIGHTS P1b proved a SECOND parent carries real MI on the large arrays -- and
+# (b) the amplitude-dependent / non-linear part of the coupling. P9 separately
+# proved that a context-conditional MEAN correction is a live, non-P5 lever (it
+# is the current leaderboard best). So: harvest the second parent's MI as a
+# MODEL-FREE CONDITIONAL MEAN in a table -- not as a second linear subtract
+# (retired `xchan_multiparent`: a summed marginal rank-1 pair over-subtracts) and
+# not as a joint 2x2 solve (P1b: pays only on large arrays). A table-based mean
+# CANNOT over-subtract and degrades gracefully to C=0 wherever the MI is absent,
+# so the downside is bounded by the +/-1 dither of an all-zero-mean bucket.
+# The GRADIENT (a difference of two same-slice residuals, not a raw level) is the
+# natural cross-channel conditioning statistic here: after the rank-1 subtract
+# each residual row is roughly zero-mean, so its raw sign carries mostly noise,
+# while the LEFT-vs-UP DIFFERENCE is the discrete spatial derivative of the
+# residual field -- the direct analogue of CALIC's local gradient texture context
+# on the image raster, transposed to the electrode array.
+#
+# WHY THIS IS NOT A RETIRED OR DUPLICATE MECHANISM (required disclosure):
+#   * NOT the retired `xctx` (cycle 9, P5): xctx conditioned the RICE PARAMETER k
+#     -- a SECOND-MOMENT, back-end lever P5 closed -- and left the residual stream
+#     byte-identical. This conditions a FIRST MOMENT of the residual stream
+#     UPSTREAM of a completely untouched Rice coder: the same disclosure both
+#     shipped bc codecs already make.
+#   * NOT a parameter variant of the shipped bc codecs: LMS4bc_lite's 27 buckets
+#     index sgn e[g,t-1] x sgn e[g,t-2] x a parent sign, and LMS4bc's 30 index
+#     quantized OWN-CHANNEL MAGNITUDES x a parent sign. Both are dominated by
+#     own-channel TEMPORAL history. This swaps the VARIABLES (two of the three
+#     axes become same-slice SPATIAL statistics), not the resolution -- it serves
+#     INSIGHTS frontier #1 at the variable level rather than the bucket-count
+#     level, which is the part of that frontier no cycle has probed.
+#   * NOT a widened backward search (P7): the bucket count is unchanged at 27 and
+#     there is no argmin of any kind here -- nothing is selected, so the winner's
+#     curse has no surface to act on.
+#
+# EMBEDDABILITY: state identical to LMS4bc_lite (27 x (int32,int16,int8) ~ 110
+# B/ch) plus a ONE-SLICE cache of reconstructed residuals so left/up/parent can be
+# read without re-deriving them (~2 B/ch) -> ~24 KB at 128 ch. Context formation
+# is 1 subtract + 3 sign tests + 2 shifted adds: NO multiply and NO divide.
+#
+# CLOSEST NEGATIVE EVIDENCE, stated before measuring: P5 measured
+# H(e_c | cross-channel context) ~ H(e_c) after LMS whitening. That was the
+# conditional ENTROPY for SCALE selection, not the conditional MEAN -- but a clean
+# null here would sharpen P5 into "the cross-channel conditional law is exhausted
+# in BOTH moments after the rank-1 subtract", which is itself a genuine result.
+# ===========================================================================
+BCXS_MAGIC = 0x5853      # 'XS' (cross-channel-gradient context, bias corrector)
+BCXS_ORDER = LMS4_ORDER  # temporal predictor stays order-4 (INSIGHTS P2)
+BCXS_NCTX = BIAS_NCTX    # 27: 3 (sgn spatial grad) x 3 (sgn parent) x 3 (sgn e[t-1])
+
+
+def _bcxs_ctx_rows(e, g, cols, C, zero):
+    """The two SAME-SLICE spatial context vectors for channel g, both drawn from
+    rows with index < g (already reconstructed on the decoder side):
+      * sgn(e[g-1, t] - e[g-cols, t]) -- the discrete spatial gradient of the
+        residual field across the electrode array (left minus up).
+      * the caller supplies the parent row separately.
+    Off-grid neighbours contribute 0, identically on both sides."""
+    li = g - 1 if (g % cols) != 0 else -1              # same row, previous column
+    ui = g - cols if g >= cols else -1                 # same column, previous row
+    gl = e[li] if li >= 0 else zero
+    gu = e[ui] if ui >= 0 else zero
+    return np.sign(gl - gu)
+
+
+def _bcxs_forward(e, parents, cols):
+    """Subtract the cross-channel-gradient-conditioned integer correction from the
+    LMS residual field e [C, N]. Returns the coded residual d. Identical JPEG-LS
+    (B, N, C) machinery as _bias_forward -- only the context word differs."""
+    e = np.asarray(e, np.int64)
+    C, N = e.shape
+    d = np.empty_like(e)
+    sg = np.sign(e)                            # -1 / 0 / +1, per sample-channel
+    zero = np.zeros(N, np.int64)
+    for g in range(C):
+        p = int(parents[g])
+        sp = sg[p] if p >= 0 else zero         # no parent -> neutral sign 0
+        sgrad = _bcxs_ctx_rows(e, g, cols, C, zero)
+        s1 = np.concatenate(([0], sg[g, :-1]))          # sgn e[g, t-1]
+        ctx = (sgrad + 1) * 9 + (sp + 1) * 3 + (s1 + 1)  # in [0, BCXS_NCTX)
+        st = _bias_new_state()                 # verbatim state / verbatim update
+        Ccor = st[2]
+        eg, dg = e[g], d[g]
+        for t in range(N):
+            q = int(ctx[t])
+            v = int(eg[t]) - Ccor[q]           # prediction := lms_pred + C[ctx]
+            dg[t] = v
+            _bias_update(st, q, v)
+    return d
+
+
+def _bcxs_inverse(d, parents, cols):
+    """Exact inverse of _bcxs_forward. Channels are walked in index order and every
+    context row (g-1, g-cols, parents[g]) has index < g, so each is fully rebuilt
+    before it is read; the single own-channel term is carried forward sample by
+    sample from the residual just reconstructed."""
+    d = np.asarray(d, np.int64)
+    C, N = d.shape
+    e = np.empty_like(d)
+    zero = np.zeros(N, np.int64)
+    for g in range(C):
+        p = int(parents[g])
+        sp = np.sign(e[p]) if p >= 0 else zero          # p < g -> already restored
+        sgrad = _bcxs_ctx_rows(e, g, cols, C, zero)     # rows < g -> already restored
+        base = (sgrad + 1) * 9 + (sp + 1) * 3
+        st = _bias_new_state()
+        Ccor = st[2]
+        dg, eg = d[g], e[g]
+        s1 = 0
+        for t in range(N):
+            q = int(base[t]) + (s1 + 1)
+            v = int(dg[t])
+            val = v + Ccor[q]                  # undo the correction
+            eg[t] = val
+            _bias_update(st, q, v)             # identical update, same d
+            s1 = 1 if val > 0 else (-1 if val < 0 else 0)
+    return e
+
+
+def bcxs_encode(x, cols=16):
+    x = np.asarray(x, np.int64)
+    C, N = x.shape
+    xt, parents, betas = _bp_select(x, cols)          # best-partner front-end (verbatim)
+    res = ec.lms_forward(xt, order=BCXS_ORDER)        # order-4 sign-sign LMS (verbatim)
+    res = _bcxs_forward(res, parents, cols)           # cross-channel-gradient bias stage
+    body = b"".join(ec.rice_encode_1d(res[c]) for c in range(C))
+    hdr = struct.pack("<HHII", BCXS_MAGIC, cols, C, N)
+    side = parents.astype("<i2").tobytes() + betas.astype("<i2").tobytes()
+    return hdr + side + body
+
+
+def bcxs_decode(buf):
+    magic, cols, C, N = struct.unpack_from("<HHII", buf, 0)
+    assert magic == BCXS_MAGIC, "bad cross-channel-gradient bias codec magic"
+    off = 12
+    parents = np.frombuffer(buf, "<i2", C, off).astype(np.int64); off += 2 * C
+    betas = np.frombuffer(buf, "<i2", C, off).astype(np.int64); off += 2 * C
+    res = np.empty((C, N), np.int64)
+    for c in range(C):
+        arr, off = ec.rice_decode_1d(buf, off)
+        res[c] = arr
+    res = _bcxs_inverse(res, parents, cols)           # matched inverse of the bias stage
+    xt = ec.lms_inverse(res, order=BCXS_ORDER)        # matched order-4 inverse
+    x = _bp_inverse(xt, parents, betas)
+    return x.astype(np.int16)
+
+
 # ===========================================================================
 # NEW candidate: propagation-aware (TIME-LAGGED) cross-channel predictor
 # (LMS4+Rice+xchan_xlag).
@@ -3904,6 +4082,409 @@ def xres_decode(buf):
     e = _xres_inverse(d, cols)                       # undo the residual-domain subtract
     x = ec.lms_inverse(e, order=XRES_ORDER)          # matched order-4 inverse
     return x.astype(np.int16)
+
+
+# ===========================================================================
+# NEW candidate: ENCODING-INTERLEAVED TWO-SIDED spatial prediction
+# (quincunx / HINT topology) -- `LMS4+Rice+xchan_hint`.
+# ---------------------------------------------------------------------------
+# Every registered spatial front-end here is ONE-SIDED: the decoder walks
+# channels in index order, so channel g may only reference neighbours with
+# index < g (_bp_candidates offers left/up/up-left/up-right). That is
+# EXTRAPOLATION from a half-plane. This candidate changes ONE variable -- the
+# SIDEDNESS of the parent set, not which parent, not how many -- by splitting
+# the electrode grid into a geometry-fixed checkerboard and coding it in TWO
+# ORDERED SUB-PASSES inside a single time slice:
+#
+#   pass 1 ("black", (row+col) even): the incumbent rank-1 best-partner
+#     subtract, but restricted to SAME-PARITY causal neighbours, so the black
+#     half is self-contained. Candidate set is the same width as the incumbent
+#     (<=4, so NO search widening -- INSIGHTS P7): the two causal diagonals
+#     (g-cols-1, g-cols+1, distance sqrt(2)) and the two distance-2 orthogonals
+#     (g-2, g-2*cols). Same _bp_opt_beta integer least-squares gain, same
+#     _bp_score Rice-bits criterion, same (parent,beta) side-info format --
+#     reused verbatim, only the candidate LIST differs.
+#   pass 2 ("white", (row+col) odd): every orthogonal distance-1 neighbour of a
+#     white channel is BLACK, hence already fully reconstructed by pass 1. So
+#     each white channel is INTERPOLATED from BOTH sides with a CONVEX
+#     (sum-to-one), multiplier-free, shift-only average of its available
+#     up/down/left/right black neighbours:
+#         h = (x[left] + x[right] + 1) >> 1      (or the single one available)
+#         v = (x[up]   + x[down]  + 1) >> 1      (or the single one available)
+#         p = (h + v + 1) >> 1                   (or whichever exists)
+#         y[white] = x[white] - p
+#     This is PREDICT-ONLY lifting: no update step, so the black parents stay
+#     bit-clean and estimation noise is injected only into the white residual --
+#     exactly the robustness condition INSIGHTS P3 credits the rank-1 subtract
+#     with and which the RETIRED energy-preserving rotations (iklt /
+#     iklt_adaptive, which corrupt BOTH channels) lack.
+#
+# THEORY. (i) TWO-SIDEDNESS: for a smooth spatial field, two-sided
+# interpolation has strictly lower error variance than one-sided extrapolation
+# -- for an AR-like array covariance, sigma^2(1 - 2*rho1^2/(1+rho2)) <
+# sigma^2(1 - rho1^2) whenever rho1 > 0 -- so the rate saved on the white half
+# is 1/2*log2 of that variance ratio. (ii) IN-PHASE AVERAGING: averaging K
+# neighbours attenuates each neighbour's INDEPENDENT noise ~1/K while
+# preserving the shared mode; INSIGHTS P6 settled (5x independent replication)
+# that the neighbour MI here is instantaneous zero-lag volume conduction, so
+# the neighbours genuinely ARE in phase and may be summed without alignment.
+# That raises the SNR of the common-mode estimate, i.e. it ATTACKS P7's binding
+# estimation-variance constraint instead of fighting it: there is no per-block
+# search at all on the white half (the topology is fixed by geometry), so the
+# winner's curse cannot apply to it.
+#
+# NOT the retired `xchan_multiparent` (cycle 8): that SUMMED two independently
+# fitted MARGINAL rank-1 subtracts (beta1+beta2 ~ 2*beta => over-subtracts).
+# Convex sum-to-one weights structurally CANNOT over-subtract: the predictor is
+# a weighted mean of the parents, total gain exactly 1.
+#
+# CAUSALITY / MATCHED PAIR. The checkerboard mask derives from (C, cols) alone,
+# which the decoder reads from the header => ZERO mask side-info. Black parents
+# are same-parity with index < g, so pass 1 inverts in channel order; white
+# channels reference only black channels, all recovered by then. The two
+# sub-passes live INSIDE one time slice, so temporal look-ahead stays 0.
+# Downstream is the unchanged order-4 sign-sign LMS + adaptive Rice.
+#
+# HONEST RISK (stated before measurement): the black half LOSES its distance-1
+# orthogonal parent and falls back to the diagonal (sqrt(2)) / distance-2. Net
+# gain = white-set improvement minus black-set degradation. INSIGHTS P1b's
+# observation that the dominant partner on tight arrays is often already a
+# diagonal neighbour is the reason to expect that cost to be small, but it is
+# real. Expect ~zero on CapgMyo (neighbour |corr| ~ 0.29, INSIGHTS P1).
+# CITATION: Roos & Viergever hierarchical interpolation (HINT) / interleaved
+# HINT; Aiazzi, Alparone & Baronti, "Lossless image compression based on
+# optimal prediction, adaptive lifting, and conditional arithmetic coding",
+# IEEE TIP 10(1):1-14, 2001 (quincunx lifting with interpolating predictors) --
+# paper-reported gains over raster-causal predictors, unverified here.
+# ===========================================================================
+XHINT_MAGIC = 0x4849        # 'HI' (HINT / quincunx two-sided spatial topology)
+XHINT_ORDER = LMS4_ORDER    # unchanged order-4 temporal predictor (P2)
+
+
+def _xhint_black(C, cols):
+    """Geometry-fixed checkerboard mask: True where (row+col) is even.
+    Derived from (C, cols) only -> zero side-info, identical on both sides."""
+    idx = np.arange(C)
+    return (((idx // cols) + (idx % cols)) % 2) == 0
+
+
+def _xhint_black_cands(g, cols, C):
+    """Causal SAME-PARITY (black) neighbours of black channel g, all index < g.
+    Width <=4, matching the incumbent _bp_candidates -- no search widening (P7).
+    Every offset shifts (row+col) by 0 or +-2, so parity is preserved."""
+    r, c = divmod(g, cols)
+    cands = []
+    if r > 0 and c > 0:
+        cands.append(g - cols - 1)        # up-left diagonal   (dist sqrt(2))
+    if r > 0 and c < cols - 1:
+        cands.append(g - cols + 1)        # up-right diagonal  (dist sqrt(2))
+    if c > 1:
+        cands.append(g - 2)               # 2-left, same row   (dist 2)
+    if r > 1:
+        cands.append(g - 2 * cols)        # 2-up, same column  (dist 2)
+    return [p for p in cands if 0 <= p < C]
+
+
+def _xhint_orth(g, cols, C):
+    """The four orthogonal distance-1 grid neighbours of g (-1 if off-grid).
+    For a white channel these are all BLACK, i.e. reconstructed in pass 1."""
+    r, c = divmod(g, cols)
+    left = g - 1 if c > 0 else -1
+    right = g + 1 if (c < cols - 1 and g + 1 < C) else -1
+    up = g - cols if r > 0 else -1
+    down = g + cols if g + cols < C else -1
+    return left, right, up, down
+
+
+def _xhint_predict(xrec, g, cols, C):
+    """Convex (sum-to-one), multiplier-free, shift-only two-sided interpolation
+    of white channel g from its already-reconstructed black orthogonal
+    neighbours. Pairs are averaged per axis first, then the two axes are
+    averaged -- every weight is a negative power of two and the weights sum to
+    exactly 1, so the predictor can never over-subtract (unlike the retired
+    summed multi-parent front-end). Returns an int64 row (zeros if isolated)."""
+    left, right, up, down = _xhint_orth(g, cols, C)
+    h = None
+    if left >= 0 and right >= 0:
+        h = (xrec[left] + xrec[right] + 1) >> 1
+    elif left >= 0:
+        h = xrec[left]
+    elif right >= 0:
+        h = xrec[right]
+    v = None
+    if up >= 0 and down >= 0:
+        v = (xrec[up] + xrec[down] + 1) >> 1
+    elif up >= 0:
+        v = xrec[up]
+    elif down >= 0:
+        v = xrec[down]
+    if h is not None and v is not None:
+        return (h + v + 1) >> 1
+    if h is not None:
+        return h
+    if v is not None:
+        return v
+    return np.zeros(xrec.shape[1], np.int64)
+
+
+def _xhint_forward(x, cols):
+    """Two ordered sub-passes over one time slice. Returns (xt, parents, betas)
+    where parents/betas are the pass-1 side-info for the BLACK channels only
+    (in black-channel order); white channels carry no side-info at all."""
+    C, N = x.shape
+    x = x.astype(np.int64)
+    black = _xhint_black(C, cols)
+    xt = x.copy()
+    parents, betas = [], []
+    # --- pass 1: black half, incumbent rank-1 best-partner subtract ----------
+    for g in range(C):
+        if not black[g]:
+            continue
+        best_bits = _bp_score(x[g])            # option: code the channel as-is
+        best_p, best_b, best_y = -1, 0, x[g]
+        for p in _xhint_black_cands(g, cols, C):
+            b = _bp_opt_beta(x[g], x[p], BP_SHIFT)
+            if b == 0:
+                continue
+            y = x[g] - ((b * x[p]) >> BP_SHIFT)
+            bits = _bp_score(y)
+            if bits < best_bits:
+                best_bits, best_p, best_b, best_y = bits, p, b, y
+        parents.append(best_p)
+        betas.append(best_b)
+        xt[g] = best_y
+    # --- pass 2: white half, two-sided convex interpolation ------------------
+    # x[black] IS the reconstruction of the black half (pass 1 is lossless), so
+    # the decoder forms the identical predictor from its recovered black rows.
+    for g in range(C):
+        if black[g]:
+            continue
+        xt[g] = x[g] - _xhint_predict(x, g, cols, C)
+    return xt, np.array(parents, np.int64), np.array(betas, np.int64)
+
+
+def _xhint_inverse(xt, cols, parents, betas):
+    """Mirror of _xhint_forward: undo pass 1 (black, channel order) and then
+    pass 2 (white, from the recovered black rows)."""
+    C, N = xt.shape
+    black = _xhint_black(C, cols)
+    x = xt.astype(np.int64).copy()
+    i = 0
+    for g in range(C):
+        if not black[g]:
+            continue
+        p = int(parents[i])
+        if p >= 0:                             # p is black and p < g -> ready
+            x[g] = xt[g] + ((int(betas[i]) * x[p]) >> BP_SHIFT)
+        i += 1
+    for g in range(C):
+        if black[g]:
+            continue
+        x[g] = xt[g] + _xhint_predict(x, g, cols, C)
+    return x
+
+
+def xhint_encode(x, cols=16):
+    x = np.asarray(x, np.int64)
+    C, N = x.shape
+    xt, parents, betas = _xhint_forward(x, cols)
+    res = ec.lms_forward(xt, order=XHINT_ORDER)
+    body = b"".join(ec.rice_encode_1d(res[c]) for c in range(C))
+    hdr = struct.pack("<HHII", XHINT_MAGIC, cols, C, N)
+    # side-info for the BLACK half only; the mask itself is derived from
+    # (C, cols) on both sides, so it costs nothing.
+    side = parents.astype("<i2").tobytes() + betas.astype("<i2").tobytes()
+    return hdr + side + body
+
+
+def xhint_decode(buf):
+    magic, cols, C, N = struct.unpack_from("<HHII", buf, 0)
+    assert magic == XHINT_MAGIC, "bad quincunx/HINT codec magic"
+    off = 12
+    nb = int(_xhint_black(C, cols).sum())
+    parents = np.frombuffer(buf, "<i2", nb, off).astype(np.int64); off += 2 * nb
+    betas = np.frombuffer(buf, "<i2", nb, off).astype(np.int64); off += 2 * nb
+    res = np.empty((C, N), np.int64)
+    for c in range(C):
+        arr, off = ec.rice_decode_1d(buf, off)
+        res[c] = arr
+    xt = ec.lms_inverse(res, order=XHINT_ORDER)     # matched order-4 inverse
+    x = _xhint_inverse(xt, cols, parents, betas)
+    return x.astype(np.int16)
+
+
+# ===========================================================================
+# NEW candidate: VARIABLE-STEP sign-sign LMS -- per-tap sign-agreement annealed
+# step size (LMS4vs+Rice+xchan_bestpartner).
+# ---------------------------------------------------------------------------
+# THE ONE VARIABLE vs the promoted `LMS4+Rice+xchan_bestpartner`: the ADAPTATION
+# LAW's step size. Everything else is reused verbatim -- the same best-partner
+# spatial front-end (`_bp_select`/`_bp_inverse`), the same order 4 (P2), the same
+# SINGLE coefficient set seeing EVERY sample, the same +/-1 update DIRECTION
+# sign(e)*sign(h_i), the same adaptive Rice back-end (P5).
+#
+# WHY (the second moment of the defect P9 proved exists). Sign-sign LMS's
+# constant +/-1 increment never converges: at the fixed point the weights
+# permanently DITHER around the Wiener solution by +-1 LSB. That dither is an
+# additive, predictor-independent excess-MSE (misadjustment) floor on EVERY
+# residual, and its size scales with the step. P9 harvested the FIRST moment of
+# exactly this defect (the context-conditional DC offset E[e|ctx]) and that
+# became the leaderboard best; a running-MEAN bias corrector structurally cannot
+# reach the zero-mean VARIANCE term. Shrinking the step where the filter is
+# already at its fixed point removes it at the source, worth ~
+# 1/2*log2(1 + mu_excess/sigma_min^2) bits/sample in the Rice code.
+#
+# THE BACKWARD-OBSERVABLE INDICATOR. For tap i the update direction
+# g_i = sign(e)*sign(h_i) is the sign of the instantaneous gradient. Consecutive
+# ALTERNATION (g_i flipping) is the signature of dithering across the fixed
+# point -> anneal (smaller step). Consecutive AGREEMENT is the signature of a
+# persistent gradient, i.e. the fixed point has MOVED (a burst onset) and
+# tracking speed is needed -> de-anneal (larger step). Both are computed from
+# quantities the decoder already has, so the rule is causal, zero side-info and
+# SELF-REVERSING under non-stationarity (INSIGHTS P4).
+#
+# INTEGER REALIZATION (shifts only, no multiply, no divide). Per tap a saturating
+# up/down counter cnt_i in [0, VS_CNT_MAX] moves +1 on agreement, -1 on
+# alternation, holds on a zero gradient; the step SHIFT is simply its top bits,
+# sh_i = cnt_i >> VS_HYST in [0, VS_SMAX], and the update is
+#
+#     w_i += sign(e)*sign(h_i) << sh_i          # == g_i << (VS_SMAX - s_i)
+#
+# with s_i = VS_SMAX - sh_i the annealing depth of the hypothesis. VS_HYST gives
+# 2^VS_HYST=4 counts of hysteresis per step-size level so the step cannot flip
+# every sample.
+#
+# CRITICALLY, the step ANNEALS BELOW the incumbent's rather than merely above it:
+# the weight fixed-point scale gains VS_SMAX extra fractional bits
+# (VS_SHIFT = LMS_SHIFT + VS_SMAX = 11), so the COARSEST step 1<<VS_SMAX in the
+# finer units is EXACTLY the incumbent's constant +/-1 step and the finest step
+# (1) is 1/8 of it. Counters start saturated high, so at t=0 this codec is
+# bit-identical in behaviour to `LMS4+Rice+xchan_bestpartner` (its weights are
+# just 8x-scaled) and it can only anneal away from there -- the incumbent is the
+# exact fast-tracking corner of the design, not a different filter. VS_SMAX=3
+# clamps the worst case to within 8x of the incumbent step, bounding the
+# over-annealing risk (a lagged burst onset raises residual energy exactly where
+# samples are expensive).
+#
+# WHAT THIS IS NOT. NOT retired LMS4rs (cycle 14, P2): that forked whole
+# coefficient BANKS by activity regime and split the adaptation data across them;
+# here ONE coefficient set sees every sample and only the LEARNING RATE is
+# modulated, so adaptation cannot fragment. NOT retired LMS4v2 (cycle 21): that
+# changed the predictor's polynomial FORM (a quadratic Volterra term) and found
+# no exploitable nonlinearity; this leaves the functional form untouched and
+# changes the ADAPTATION LAW -- an axis no row of CYCLE_LOG has touched. NOT a
+# P7 search widening: the counter is continuous scalar state, not an argmin over
+# K hypotheses, so no winner's curse. NOT a P5 entropy-coder play: the coder is
+# untouched adaptive Rice.
+#
+# Basis: Harris, Chabries & Bishop, "A variable step (VS) adaptive filter
+# algorithm", IEEE TASSP 34(2):309-316, 1986 (per-tap step doubled/halved on
+# runs of gradient-sign agreement), and the VSS-LMS review literature --
+# paper-reported, unverified here. This is the divisionless realization of the
+# survey's long-standing "NLMS / leaky LMS" row, preferred over full NLMS
+# because NLMS needs a divide/reciprocal the FPGA target penalizes.
+# ===========================================================================
+VS_MAGIC = 0x5653          # 'VS' (variable step)
+VS_ORDER = LMS4_ORDER      # order stays 4 (INSIGHTS P2), ONE coefficient set
+VS_SMAX = 3                # annealing depth: step spans 2^0 .. 2^VS_SMAX
+VS_SHIFT = ec.LMS_SHIFT + VS_SMAX     # 11 -- weight scale gains VS_SMAX bits so
+#                                       the COARSEST step == the incumbent's +/-1
+VS_HYST = 2                           # 2^2 = 4 counter counts per step level
+VS_CNT_MAX = ((VS_SMAX + 1) << VS_HYST) - 1   # 15 -> sh = cnt>>2 lands in 0..3
+VS_CNT_INIT = VS_CNT_MAX              # start at the incumbent (fastest) step
+
+
+def _vs_update(w, cnt, pg, g):
+    """The shared variable-step sign-sign update, applied IDENTICALLY by encoder
+    and decoder. g = sign(e)*sign(hist) is the (unchanged) +/-1 update direction.
+
+      * apply the update at the CURRENT per-tap step 1 << (cnt >> VS_HYST)
+      * then move the saturating counter on the agreement of CONSECUTIVE
+        gradient signs: +1 if g agrees with the last non-zero gradient
+        (persistent gradient -> speed up), -1 if it alternates (dithering at
+        the fixed point -> anneal), hold if g == 0 (a zero-valued tap carries
+        no gradient information and must not break the agreement run).
+
+    All in-place / returned as int64 arrays; shifts only -- no multiply, no
+    divide, no float anywhere."""
+    w += g << (cnt >> np.int64(VS_HYST))
+    act = g * pg                                  # +1 agree, -1 alternate, 0 idle
+    cnt += (act > 0).astype(np.int64) - (act < 0).astype(np.int64)
+    np.clip(cnt, 0, VS_CNT_MAX, out=cnt)
+    return np.where(g != 0, g, pg)                # remembered gradient sign
+
+
+def _vs_forward(x, order=VS_ORDER, shift=VS_SHIFT):
+    """Order-4 sign-sign LMS with a per-tap sign-agreement variable step.
+    Vectorized over channels; identical structure to ec.lms_forward apart from
+    the step logic and the finer weight scale."""
+    C, N = x.shape
+    x = x.astype(np.int64)
+    w = np.zeros((C, order), np.int64)                     # taps at scale 2^-shift
+    hist = np.zeros((C, order), np.int64)                  # past recon. samples
+    cnt = np.full((C, order), VS_CNT_INIT, np.int64)       # per-tap step counters
+    pg = np.zeros((C, order), np.int64)                    # last non-zero gradient
+    res = np.empty((C, N), np.int64)
+    for t in range(N):
+        pred = (w * hist).sum(axis=1) >> shift
+        e = x[:, t] - pred
+        res[:, t] = e
+        g = np.sign(e)[:, None] * np.sign(hist)            # direction UNCHANGED
+        pg = _vs_update(w, cnt, pg, g)
+        hist[:, 1:] = hist[:, :-1]
+        hist[:, 0] = x[:, t]
+    return res
+
+
+def _vs_inverse(res, order=VS_ORDER, shift=VS_SHIFT):
+    """Exact inverse of _vs_forward. e is read from the coded residual, hist is
+    the reconstructed signal, so the counters, the per-tap step and the weights
+    all evolve from causally-available data identically on both sides -- a
+    matched pair with ZERO side-info."""
+    C, N = res.shape
+    res = res.astype(np.int64)
+    w = np.zeros((C, order), np.int64)
+    hist = np.zeros((C, order), np.int64)
+    cnt = np.full((C, order), VS_CNT_INIT, np.int64)
+    pg = np.zeros((C, order), np.int64)
+    x = np.empty((C, N), np.int64)
+    for t in range(N):
+        pred = (w * hist).sum(axis=1) >> shift
+        e = res[:, t]
+        xt = pred + e
+        x[:, t] = xt
+        g = np.sign(e)[:, None] * np.sign(hist)
+        pg = _vs_update(w, cnt, pg, g)
+        hist[:, 1:] = hist[:, :-1]
+        hist[:, 0] = xt
+    return x
+
+
+def vsbp_encode(x, cols=16):
+    x = np.asarray(x, np.int64)
+    C, N = x.shape
+    xt, parents, betas = _bp_select(x, cols)     # promoted best-partner front-end
+    res = _vs_forward(xt)                        # variable-step order-4 sign-LMS
+    body = b"".join(ec.rice_encode_1d(res[c]) for c in range(C))
+    hdr = struct.pack("<HHII", VS_MAGIC, cols, C, N)
+    side = parents.astype("<i2").tobytes() + betas.astype("<i2").tobytes()
+    return hdr + side + body
+
+
+def vsbp_decode(buf):
+    magic, cols, C, N = struct.unpack_from("<HHII", buf, 0)
+    assert magic == VS_MAGIC, "bad variable-step LMS bestpartner codec magic"
+    off = 12
+    parents = np.frombuffer(buf, "<i2", C, off).astype(np.int64); off += 2 * C
+    betas = np.frombuffer(buf, "<i2", C, off).astype(np.int64); off += 2 * C
+    res = np.empty((C, N), np.int64)
+    for c in range(C):
+        arr, off = ec.rice_decode_1d(buf, off)
+        res[c] = arr
+    xt = _vs_inverse(res)
+    x = _bp_inverse(xt, parents, betas)
+    return x.astype(np.int16)
+
 
 # ===========================================================================
 # Uniform codec objects + the registry
@@ -4918,6 +5499,96 @@ _register(Codec("LMS4bc_lite+Rice+xchan_bestpartner", biasbp_encode, biasbp_deco
          "context-conditioned integer bias cancellation on the prediction "
          "(27 sign contexts, divisionless, zero side-info) + Rice"))
 
+# NEW candidate (this cycle): CROSS-CHANNEL-GRADIENT CONTEXT for the proven bias
+# corrector (`bcxs`). The JPEG-LS (B, N, C) machinery is LMS4bc_lite's verbatim
+# (same _bias_new_state / _bias_update, same 27 buckets, same divisionless
+# counter-halving, same int8 clamp, same zero side-info) -- only the CLASS of
+# conditioning variables changes, from own-channel temporal history to co-located
+# SAME-SLICE spatial residual gradients. Ops/sample-ch on top of
+# _LMS4_OPS + _XCHAN_OPS: form the spatial gradient e[left]-e[up] from the
+# one-slice residual cache (1 subtract) and quantize it (1 sign), read the parent
+# and own-previous signs from that same cache (2), assemble the context index (2
+# shifted adds), correction table load (1), correction subtract (1), accumulator
+# add + count increment (2), band compare + /-1 nudge with its amortised halving
+# shift (~1) ~ 11 -- i.e. ~3 ops more than LMS4bc_lite's 8, the price of the one
+# extra subtract and the extra cached row. Still NO multiply and NO divide
+# anywhere in the stage. The decoder runs the byte-identical update on the same
+# coded residual, so the stage costs the same on both sides; dec_ops omits only
+# the encoder-side best-partner neighbour scan, exactly as in the sibling codecs.
+# State/ch: 27 contexts x (B + N + C) = 108 B, plus the own-sign register and the
+# one-slice reconstructed-residual cache that makes left/up/parent readable
+# without re-deriving them (4 B) = 112 B, on top of the order-4 LMS +
+# best-partner state -> ~150 B/ch, ~19 KB at 128 ch, far inside the SRAM budget.
+_BCXS_XTRA = 11
+_BCXS_STATE = BCXS_NCTX * 4 + 4   # (sum,count,correction)/ctx + sign reg + slice cache
+_BCXS_NOTE = (
+    "CROSS-CHANNEL-GRADIENT CONTEXT for the proven JPEG-LS/CALIC bias corrector. "
+    "The (B, N, C) bias-cancellation machinery of LMS4bc_lite is reused VERBATIM "
+    "(literally the same _bias_new_state / _bias_update: 27 buckets, running "
+    "(sum,count) accumulator, counter halving by a SHIFT at N=64, +/-1 nudge when "
+    "the running sum leaves the band (-N,0], int8-clamped correction, no divide, "
+    "no multiply, ZERO side-info). The ONE variable changed is the CLASS of "
+    "conditioning variables: own-channel temporal residual history is replaced by "
+    "CO-LOCATED SPATIAL RESIDUAL GRADIENTS from the SAME TIME SLICE -- "
+    "ctx = (sgn(e[g-1,t] - e[g-cols,t]), sgn(e[parent(g),t]), sgn(e[g,t-1])) -> "
+    "3x3x3 = 27 buckets, all from already-decoded residuals. left=g-1, up=g-cols "
+    "and parent(g) all have index < g, so every context row is fully reconstructed "
+    "when the decoder reaches channel g inside the same slice -- exactly the "
+    "ordering _bias_forward already relies on, no new ordering machinery, "
+    "look-ahead 0, zero side-info (INSIGHTS P4). Off-grid neighbours contribute 0, "
+    "identically on both sides. THEORY: Wu & Memon, 'Context-based lossless "
+    "interband compression -- extending CALIC', IEEE TIP 9(6):994-1001, 2000 "
+    "(paper-reported, unverified here) show that context modelling of the "
+    "PREDICTION-ERROR FIELD captures higher-order interband correlation a linear "
+    "interband predictor cannot reach. The best-partner front-end IS such a "
+    "predictor -- it removes only the rank-1, scalar-gain, linear projection onto "
+    "ONE neighbour -- so what survives is (a) dependence on neighbours that "
+    "projection never used (P1b proved a SECOND parent carries real MI on the "
+    "large arrays) and (b) the amplitude-dependent/non-linear part. P9 separately "
+    "proved a context-conditional MEAN correction is a live, non-P5 lever. So the "
+    "second parent's MI is harvested as a MODEL-FREE CONDITIONAL MEAN in a table "
+    "-- NOT as a second linear subtract (retired xchan_multiparent: a summed "
+    "marginal rank-1 pair OVER-subtracts) and NOT as a joint 2x2 solve (P1b: pays "
+    "only on large arrays). A table-based mean structurally cannot over-subtract "
+    "and degrades gracefully to C=0 where the MI is absent. The GRADIENT rather "
+    "than a raw level is the right cross-channel statistic here: after the rank-1 "
+    "subtract each residual row is roughly zero-mean so its raw sign is mostly "
+    "noise, while left-minus-up is the discrete spatial derivative of the residual "
+    "field -- CALIC's local-gradient texture context transposed from the image "
+    "raster to the electrode array. DISTINCT FROM THE RETIRED/SHIPPED MECHANISMS: "
+    "not xctx (cycle 9, P5) -- xctx conditioned the RICE PARAMETER k, a "
+    "SECOND-MOMENT back-end lever, and left the residual stream byte-identical; "
+    "this conditions a FIRST MOMENT of the residual stream UPSTREAM of a "
+    "completely untouched Rice coder, the same disclosure both shipped bc codecs "
+    "already make. Not a parameter variant of those bc codecs -- the 27-ctx "
+    "sibling indexes signs of own-channel e[t-1], e[t-2] plus a parent sign and "
+    "the 30-ctx one indexes quantized own-channel MAGNITUDES plus a parent sign, "
+    "both temporal-dominated; this swaps the VARIABLES (two of three axes become "
+    "same-slice SPATIAL statistics), not the resolution, serving frontier #1 at "
+    "the variable level rather than the bucket-count level. Not a widened backward "
+    "search (P7): bucket count is unchanged at 27 and nothing is selected, so the "
+    "winner's curse has no surface to act on. Best-partner selection is derived "
+    "offline over the whole signal like the incumbent (embeddable realization "
+    "selects per block, look-ahead=block); the bias stage itself is pure "
+    "streaming. CLOSEST NEGATIVE EVIDENCE, stated before measuring: P5 measured "
+    "H(e_c | cross-channel context) ~ H(e_c) after LMS whitening -- that was the "
+    "conditional ENTROPY for SCALE selection, not the conditional MEAN, but a "
+    "clean null here would sharpen P5 into 'the cross-channel conditional law is "
+    "exhausted in BOTH moments after the rank-1 subtract', itself a genuine "
+    "result.")
+_register(Codec("LMS4bcxs+Rice+xchan_bestpartner", bcxs_encode, bcxs_decode,
+    CodecMeta(
+        integer_only=True,
+        enc_ops=_LMS4_OPS + _XCHAN_OPS + _BP_SELECT_OPS + _BCXS_XTRA,
+        dec_ops=_LMS4_OPS + _XCHAN_OPS + _BCXS_XTRA,
+        state_bytes_per_ch=_LMS4_STATE + _BP_STATE + _BCXS_STATE, causal=True,
+        lookahead_samples=ec.BLOCK, block_size=ec.BLOCK, notes=_BCXS_NOTE),
+    family="temporal",
+    desc="order-4 LMS + best-partner cross-channel subtract + JPEG-LS-style bias "
+         "cancellation conditioned on CO-LOCATED SPATIAL RESIDUAL GRADIENTS "
+         "(sgn(e[left]-e[up]) x sgn(e[parent]) x sgn(e[t-1]), 27 buckets, "
+         "divisionless, zero side-info) + Rice"))
+
 # NEW candidate (this cycle): propagation-aware (TIME-LAGGED) cross-channel
 # predictor. Ops/sample-ch on top of the order-4 LMS base (_LMS4_OPS), all counted
 # per sample-channel with the per-block work amortised over B=256:
@@ -5225,6 +5896,189 @@ _register(Codec("LMS4+Rice+xchan_xres", xres_encode, xres_decode, CodecMeta(
                    "spatial stage can subtract it. Stage ORDER dominates the (correct) "
                    "scored-quantity==coded-quantity refinement."))
 
+
+# NEW candidate (this cycle): encoding-interleaved TWO-SIDED spatial prediction
+# (quincunx / HINT topology). Ops, averaged over the two halves of the
+# checkerboard (each is half the channels):
+#   * BLACK half: identical to the incumbent best-partner front-end -- the
+#     applied rank-1 subtract (1 mul + 1 shift + 1 sub = _XCHAN_OPS) plus the
+#     <=4-candidate scan with amortised argmin (_BP_SELECT_OPS). Candidate set
+#     is the SAME WIDTH as the incumbent's, so the selection cost is unchanged.
+#   * WHITE half: NO search and NO multiply at all -- 3 adds + 3 rounding
+#     shifts for the convex two-sided average + 1 sub = ~7 ops.
+# -> 0.5*(3+8) + 0.5*7 = ~9 extra ops/sample-ch on top of _LMS4_OPS. The
+# decoder is search-free on the black half (0.5*3 + 0.5*7 = 5).
+# State: order-4 LMS (_LMS4_STATE) + the black half's (parent byte, int16 beta,
+# parent sample) = _BP_STATE on half the channels, + ONE time-slice of
+# reconstructed black neighbours for the white pass (1 int16/ch = 2 B/ch,
+# ~256 B at 128 ch) -> 0.5*7 + 2 = ~5 B/ch beyond the LMS state. No multiply,
+# no divide, no per-block search on the white half.
+_XHINT_XTRA = 9
+_XHINT_STATE = 5
+_XHINT_NOTE = (
+    "ENCODING-INTERLEAVED TWO-SIDED spatial prediction (quincunx / HINT "
+    "topology). The ONE variable vs LMS4+Rice+xchan_bestpartner is the "
+    "SIDEDNESS of the parent set -- not which parent, not how many. The grid is "
+    "split by a geometry-fixed checkerboard ((row+col) parity, derived from "
+    "(C,cols) by BOTH sides -> ZERO mask side-info) and coded in two ordered "
+    "sub-passes INSIDE one time slice (temporal look-ahead 0). Pass 1 (black): "
+    "the incumbent rank-1 best-partner subtract reused verbatim (_bp_opt_beta "
+    "integer-LS gain, _bp_score Rice-bits criterion, 2xint16 side-info) but "
+    "restricted to SAME-PARITY causal neighbours -- the two diagonals "
+    "(g-cols-1, g-cols+1) and the two distance-2 orthogonals (g-2, g-2*cols), "
+    "<=4 candidates, the SAME search width as the incumbent so no widening "
+    "(P7). Pass 2 (white): every orthogonal distance-1 neighbour of a white "
+    "channel is black, hence already reconstructed, so the channel is "
+    "INTERPOLATED FROM BOTH SIDES by a CONVEX (sum-to-one), multiplier-free, "
+    "shift-only average -- h=(left+right+1)>>1, v=(up+down+1)>>1, "
+    "pred=(h+v+1)>>1, degrading gracefully at the array edges -- with NO search "
+    "and NO side-info of any kind. THEORY (i) two-sided interpolation has "
+    "strictly lower error variance than one-sided extrapolation on a smooth "
+    "field: sigma^2(1-2*rho1^2/(1+rho2)) < sigma^2(1-rho1^2) for rho1>0, saving "
+    "1/2*log2 of that variance ratio on half the channels; (ii) averaging K "
+    "IN-PHASE neighbours attenuates each one's independent noise ~1/K while "
+    "preserving the shared mode -- P6 settled by 5x replication that the "
+    "neighbour MI here is instantaneous zero-lag volume conduction, so the "
+    "parents genuinely are in phase -- which RAISES the SNR of the common-mode "
+    "estimate and thus attacks P7's estimation-variance constraint rather than "
+    "fighting it (the white half has no per-block search, so the winner's curse "
+    "cannot apply to it). PREDICT-ONLY LIFTING, no update step: the black "
+    "parents stay bit-clean and estimation noise enters only the white "
+    "residual -- P3's stated robustness condition, which the RETIRED "
+    "energy-preserving rotations (iklt/iklt_adaptive, corrupting BOTH channels) "
+    "violate. NOT the retired xchan_multiparent: that SUMMED two independently "
+    "fitted marginal rank-1 subtracts (beta1+beta2 ~ 2*beta => over-subtracts); "
+    "convex sum-to-one weights have total gain exactly 1 and structurally "
+    "cannot over-subtract. Downstream order-4 sign-sign LMS + adaptive Rice "
+    "unchanged (no entropy-coder play, cf. P5). HONEST RISK stated before "
+    "measurement: the black half loses its distance-1 orthogonal parent and "
+    "falls back to the diagonal/distance-2, so the net is the white-set gain "
+    "MINUS the black-set degradation; P1b (the dominant partner on tight arrays "
+    "is often already a diagonal) is the reason to expect that cost to be "
+    "small, but it is real, and ~zero is expected on CapgMyo (rho~0.29, P1). "
+    "Pass-1 selection is derived offline over the whole signal exactly like the "
+    "incumbent bestpartner (embeddable realization re-selects per block, "
+    "look-ahead=block); the HINT pass 2 itself is look-ahead 0 and stateless. "
+    "Basis: Roos & Viergever hierarchical interpolation (HINT)/interleaved-HINT "
+    "and Aiazzi, Alparone & Baronti, IEEE TIP 10(1):1-14, 2001 (quincunx "
+    "lifting with optimal interpolating predictors) -- paper-reported, "
+    "unverified here.")
+_register(Codec("LMS4+Rice+xchan_hint", xhint_encode, xhint_decode, CodecMeta(
+    integer_only=True, enc_ops=_LMS4_OPS + _XHINT_XTRA,
+    dec_ops=_LMS4_OPS + 5,
+    state_bytes_per_ch=_LMS4_STATE + _XHINT_STATE, causal=True,
+    lookahead_samples=ec.BLOCK, block_size=ec.BLOCK, notes=_XHINT_NOTE),
+    family="cross-channel",
+    desc="order-4 LMS + quincunx/HINT two-sided spatial prediction (checkerboard: "
+         "same-parity best-partner subtract, then convex shift-only interpolation "
+         "of the interleaved half from both sides) + Rice",
+    retired=True,
+    retired_reason="Conclusively Pareto-dominated by LMS+Rice+xchan_joint2 (cost 0.0366 < "
+                   "0.0371) on ALL 4 real sets (cycle 2026-08-19, results/cycle_bench.csv): "
+                   "hyser 1.45868x vs 1.49300x (-2.30%), otb 2.11517x vs 2.14968x (-1.61%), "
+                   "capgmyo 1.31459x vs 1.35044x (-2.66%), cemhsey 1.87894x vs 1.95427x "
+                   "(-3.86%) -- worse ratio everywhere AND higher cost. Isolated xchan gain "
+                   "vs LMS+Rice is lower than the incumbent best-partner front-end on every "
+                   "real set (hyser +9.68% vs +11.31%, otb +15.88% vs +18.44%, cemhsey +8.65% "
+                   "vs +13.08%, capgmyo -1.33% vs +1.37%): a unity-gain convex two-sided mean "
+                   "cannot track the neighbour amplitude ratio that a fitted rank-1 beta can, "
+                   "and the parity restriction starves the black half of its dist-1 orthogonal "
+                   "parents. Wins both synthetic smooth fields (sc0.6 2.6366x, sc0.9 2.6157x, "
+                   "top of the run) -- classic basis-match-to-a-stationary-field artifact that "
+                   "does not survive real anisotropic non-stationary HD-sEMG (INSIGHTS P3/P11)."))
+
+
+# NEW candidate (this cycle): VARIABLE-STEP (per-tap sign-agreement annealed)
+# sign-sign LMS under the promoted best-partner front-end. The spatial stage,
+# the predictor order, the number of coefficient sets, the update DIRECTION and
+# the Rice back-end are all the incumbent's; only the step SIZE moves.
+# Ops on top of the order-4 LMS work (_LMS4_OPS), per tap per sample:
+#   * 1 compare of the current gradient sign against the remembered one
+#     (the two signs are already computed for the update itself -- free),
+#   * 1 saturating up/down add on the 4-bit counter,
+#   * 1 barrel-shift of the +/-1 increment by the counter's top 2 bits (the
+#     shift amount is a wire, not an arithmetic op, in hardware),
+# -> ~3 ops x 4 taps = ~12 extra ops/sample-ch. Multiply-free and divide-free
+# (this is why the divisionless VS-LMS is preferred to NLMS on the FPGA target).
+# State on top of _LMS4_STATE: 4 counters (1 B each) + 4 remembered gradient
+# signs (2 bits each, 1 B packed) + widening the 4 weights from int16 to int24
+# to hold the VS_SMAX=3 extra fractional bits (4 B) = ~9 B/ch (~1.2 KB at
+# 128 ch). Fully backward-adaptive -> ZERO temporal side-info, look-ahead 0 for
+# the temporal stage (P4); the only side-info is the best-partner (parent,beta)
+# pair, derived offline exactly like the incumbent. The decoder mirrors every
+# counter/step/weight update, so dec_ops == enc_ops minus the encoder-only
+# neighbour scan.
+_VS_XTRA = 12
+_VS_STATE = _LMS4_STATE + 9
+_VSBP_NOTE = (
+    "VARIABLE-STEP sign-sign LMS: per-tap step size annealed by a small "
+    "saturating counter on the agreement of CONSECUTIVE gradient signs. Keeps "
+    "the promoted order-4 best-partner spatial front-end (best-of-4 causal grid "
+    "neighbour + integer gain, 2xint16/ch side-info, reused VERBATIM), keeps "
+    "order 4 (P2), keeps ONE coefficient set seeing EVERY sample, keeps the "
+    "+/-1 update DIRECTION sign(e)*sign(h_i), keeps adaptive Rice (P5). The ONE "
+    "variable is the step: w_i += sign(e)*sign(h_i) << (SMAX - s_i), where s_i "
+    "is the annealing depth held in a 4-bit saturating up/down counter that "
+    "moves +1 when the tap's gradient sign AGREES with the previous one and -1 "
+    "when it ALTERNATES (4 counts of hysteresis per step level, hold on a "
+    "zero-valued tap). THEORY: sign-sign LMS's constant increment never "
+    "converges -- at its fixed point the weights permanently dither by +-1 LSB, "
+    "an additive predictor-independent excess-MSE (misadjustment) floor on EVERY "
+    "residual that scales with the step and inflates the Rice code by roughly "
+    "1/2*log2(1 + mu_excess/sigma_min^2) bits/sample. P9 harvested the FIRST "
+    "moment of exactly this defect (the context-conditional DC E[e|ctx]) and "
+    "that became the leaderboard best; a running-MEAN corrector structurally "
+    "cannot reach the zero-mean VARIANCE term, so this attacks it at the source. "
+    "Alternating gradient signs are the direct backward-observable signature of "
+    "'at the fixed point, dithering'; agreement signals a burst onset where "
+    "tracking speed is needed -- so the rule is causal, zero side-info and "
+    "SELF-REVERSING under non-stationarity (P4). INTEGER REALIZATION: shifts "
+    "only, no multiply and no divide (the reason this divisionless VS-LMS is "
+    "preferred to full NLMS, whose reciprocal the FPGA target penalizes). The "
+    "weight fixed-point scale gains SMAX=3 fractional bits, so the COARSEST step "
+    "is EXACTLY the incumbent's constant +/-1 and annealing goes genuinely BELOW "
+    "it (down to 1/8); counters start saturated high, so at t=0 the filter is "
+    "behaviourally identical to LMS4+Rice+xchan_bestpartner (weights merely "
+    "8x-scaled) and can only anneal away from it -- the incumbent is this "
+    "design's exact fast-tracking corner. NOT the retired LMS4rs (that forked "
+    "whole coefficient BANKS by activity regime and fragmented the adaptation "
+    "data; here one set sees every sample and only the LEARNING RATE moves). NOT "
+    "the retired LMS4v2 (that changed the predictor's polynomial FORM and found "
+    "no exploitable nonlinearity; this leaves the form untouched and changes the "
+    "ADAPTATION LAW -- an axis untouched by CYCLE_LOG rows 1-30). NOT a P7 "
+    "widening: the counter is continuous scalar state, not an argmin over K "
+    "hypotheses, so no winner's curse. STATED RISK before measurement: "
+    "over-annealing lags burst onsets and would raise residual energy exactly "
+    "where samples are expensive -- SMAX=3 clamps the worst case to within 8x of "
+    "the incumbent step to bound that. Selection front-end derived offline like "
+    "the incumbent bestpartner (embeddable realization selects per block, "
+    "look-ahead=block). Basis: Harris, Chabries & Bishop, 'A variable step (VS) "
+    "adaptive filter algorithm', IEEE TASSP 34(2):309-316, 1986, and the "
+    "VSS-LMS review literature -- paper-reported, unverified here.")
+_register(Codec("LMS4vs+Rice+xchan_bestpartner", vsbp_encode, vsbp_decode,
+    CodecMeta(
+        integer_only=True, enc_ops=_LMS4_OPS + _VS_XTRA + _XCHAN_OPS + _BP_SELECT_OPS,
+        dec_ops=_LMS4_OPS + _VS_XTRA + _XCHAN_OPS,
+        state_bytes_per_ch=_VS_STATE + _BP_STATE, causal=True,
+        lookahead_samples=ec.BLOCK, block_size=ec.BLOCK, notes=_VSBP_NOTE),
+    family="temporal",
+    desc="per-tap sign-agreement VARIABLE-STEP order-4 sign-sign LMS (saturating "
+         "gradient-agreement counter sets a power-of-two step, shifts only) + "
+         "best-partner + Rice",
+    retired=True,
+    retired_reason="Conclusively Pareto-dominated by LMS4+Rice+xchan_bestpartner (cost 0.0394 "
+                   "< 0.0516, identical front-end and back-end) on real data (cycle 2026-08-19, "
+                   "results/cycle_bench.csv): hyser 1.479529x vs 1.480384x (-0.058%), otb "
+                   "2.155639x vs 2.161938x (-0.291%), capgmyo 1.347197x vs 1.350480x (-0.243%), "
+                   "cemhsey 1.955617x vs 1.955547x (+0.0036%, a dead tie by the repo's own "
+                   "+/-0.02% convention) -- worse or tied on all 4 real sets at +31% cost; "
+                   "4-set mean 1.73450 vs 1.73709. Annealing the sign-sign step lowers "
+                   "misadjustment (gradient-noise variance) but slows tracking; the +0.018/ "
+                   "+0.020% it gains on the near-stationary synthetics and loses on every real "
+                   "set shows order-4 sign-sign LMS on HD-sEMG is TRACKING-limited, not "
+                   "misadjustment-limited. The residual's remaining excess entropy is a "
+                   "context-conditional FIRST moment (removable, P9) not a step-size variance "
+                   "term (INSIGHTS P12)."))
 
 
 def list_codecs(include_retired=False):
