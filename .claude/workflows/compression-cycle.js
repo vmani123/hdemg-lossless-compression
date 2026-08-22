@@ -107,9 +107,14 @@ any non-bit-exact round-trip -- fix it, don't work around it):
 
 Workflow: restate the one hypothesis; make the minimal edit; run the self-test until bit-exact;
 if you cannot reach bit-exactness after a genuine effort, REVERT your edit (git checkout the
-touched files) so the tree is clean and report the failure honestly. Do NOT run bench --
-measurement is a separate phase. Report the exact Codec("...") name you registered, whether the
-self-test passed, the exact command + full output, and a one-line cost-metadata summary.`
+touched files) so the tree is clean and report the failure honestly. Before finishing, also run
+\`PYTHONPATH=host_tools ./.venv/bin/python research/registry.py --audit\` once -- the thorough gate
+(known-answer Rice-coder cross-check, synthetic edge cases, real-data round-trips, determinism,
+degenerate sanity bounds). It is slower (~2-3 min) so it is not the per-edit loop, but it catches
+shape/overflow bugs a single friendly fixture misses (e.g. a sub-block-size input) BEFORE a
+verifier finds it. Do NOT run bench -- measurement is a separate phase. Report the exact
+Codec("...") name you registered, whether the self-test AND the audit passed, the exact commands +
+full output, and a one-line cost-metadata summary.`
 
 const VERIFIER_ROLE = `You are a VERIFIER: an independent gatekeeper before any codec is promoted to LEADERBOARD.md.
 You trust nothing you didn't reproduce yourself. You do NOT edit codecs -- you audit only. You
@@ -119,15 +124,31 @@ Read first: compression_spec/cost_model.md (embedded_ok gate + cost formula),
 research/embedded_cost.py, research/registry.py for the codec under review.
 
 Audit checklist -- RUN it, don't reason it:
-1. Bit-exact round-trip, from scratch: \`PYTHONPATH=host_tools ./.venv/bin/python
-   research/registry.py --selftest\`. Any mismatch / codec missing / FAIL => REJECT.
+1. Bit-exact + known-answer + real-data correctness, from scratch: \`PYTHONPATH=host_tools
+   ./.venv/bin/python research/registry.py --audit\`. This is the standing, code-enforced
+   correctness gate (non-negotiable #4: no hallucinated benchmark numbers) -- it cross-checks the
+   shared Rice coder against an INDEPENDENTLY written decoder, round-trips every active codec on
+   several awkward synthetic edge cases AND real slices of all four committed datasets, checks
+   encode() is deterministic, and checks two degenerate-case ratio bounds (all-zero must compress
+   hugely, full-range white noise must not compress at all). Run this instead of hand-rolling your
+   own ad hoc edge-case probes each cycle -- it is the same command every verifier runs, so a
+   FAIL here is unambiguous and reproducible by the other verifier. Any FAIL / mismatch /
+   exception => REJECT. (\`--selftest\` alone, the fast per-edit variant, is NOT sufficient for a
+   promotion verdict -- it only proves round-trip on one synthetic fixture.)
 2. Re-measure the ratio yourself on REAL data with the ground-truth tool -- run
    \`PYTHONPATH=host_tools ./.venv/bin/python research/bench.py --datasets otb_hdsemg_vl
    hyser_1dof_f1_s1 --csv <a scratch csv path>\` -- do NOT trust any handed-to-you CSV. Confirm
    the codec's ratio (and, if it has an xchan lever, cross-channel gain) reproduce.
-3. Cost gate: confirm embedded_ok + cost are consistent with cost_model.md -- integer/fixed
-   only (float => disqualified), causal + bounded block, state fits SRAM/BRAM, ops/sample-ch
-   fit the rate budget. Not embedded_ok => cannot be promoted regardless of ratio.
+3. Cost gate: don't just reason about cost_model.md by hand -- run \`PYTHONPATH=host_tools
+   ./.venv/bin/python research/embedded_verify.py\` (this repo's existing causality/cost-
+   self-consistency/FPGA cross-check on the CODE, not the codec's self-reported metadata) and
+   find your candidate's row. A whole-signal-beta \`+xchan_bestpartner\`-family codec will show
+   as non-streaming-as-benchmarked under --strict -- that is an ALREADY-DOCUMENTED, accepted
+   caveat (research/EMBEDDED_OK_VERIFICATION.md), not new evidence by itself. What IS a REJECT
+   signal: your candidate showing a discrepancy NOT already covered by that documented pattern
+   (e.g. its own declared enc_ops/state understate what embedded_verify.py measures, or
+   fpga_ok=NO where the leaderboard family is YES). Not embedded_ok (or a new, undisclosed
+   discrepancy) => cannot be promoted regardless of ratio.
 4. Sanity: any lossless ratio > ~6x on realistic broadband REAL data => leak/degenerate =>
    REJECT and report. (Do not run sim/run_sim.sh; RTL is not touched by codec cycles.)
 

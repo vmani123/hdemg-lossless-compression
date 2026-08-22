@@ -270,7 +270,107 @@ def decode(buf):
 
 
 # ---------------------------------------------------------------------------
+# Known-answer / independent cross-check tests for the shared Rice coder.
+#
+# Non-negotiable #4 (no hallucinated correctness): every codec in research/
+# registry.py funnels its residual stream through rice_encode_1d/rice_decode_1d,
+# so a subtle bug here would silently corrupt every measured ratio at once while
+# still passing a plain decode(encode(x))==x round-trip (a paired encoder/decoder
+# can share the same bug and still agree with ITSELF). The check below decodes
+# rice_encode_1d's actual byte output using a decoder written FROM SCRATCH here,
+# independently, with no shared code -- it re-derives the header layout and the
+# Golomb-Rice bit convention (q zero-bits, a 1 stop-bit, then k remainder bits
+# MSB-first) from this module's own docstring/comments, not by calling
+# rice_decode_1d. Agreement between two independently-written implementations is
+# real evidence the format is what it claims to be, not just that a function
+# round-trips through its own paired inverse.
+# ---------------------------------------------------------------------------
+def _independent_rice_decode(buf):
+    """From-scratch reference Golomb-Rice decoder for rice_encode_1d's on-disk
+    format. Deliberately unvectorized (plain Python bit-by-bit) and shares no
+    code with rice_decode_1d -- see the module note above for why."""
+    n, bs = struct.unpack_from('<IH', buf, 0)
+    nblocks = (n + bs - 1) // bs
+    off = 6
+    ks = list(buf[off:off + nblocks]); off += nblocks
+    (plen,) = struct.unpack_from('<I', buf, off); off += 4
+    packed = buf[off:off + plen]
+    bits = []
+    for byte in packed:
+        for shift in range(7, -1, -1):     # MSB-first per byte, matches np.unpackbits
+            bits.append((byte >> shift) & 1)
+    pos = 0
+    out = []
+    for b in range(nblocks):
+        k = ks[b]
+        cnt = min(bs, n - b * bs)
+        for _ in range(cnt):
+            q = 0
+            while bits[pos] == 0:
+                q += 1
+                pos += 1
+            pos += 1                        # the stop bit itself
+            r = 0
+            for _ in range(k):
+                r = (r << 1) | bits[pos]
+                pos += 1
+            u = (q << k) | r
+            out.append((u >> 1) ^ -(u & 1))  # unzigzag, done by hand here too
+    return out
+
+
+def _known_answer_tests():
+    rng = np.random.default_rng(1234)
+
+    # 1) zigzag/unzigzag: hand-verifiable small values (0->0, -1->1, 1->2, -2->3, ...)
+    s = np.array([0, -1, 1, -2, 2, -32768, 32767], dtype=np.int64)
+    expected_zz = np.array([0, 1, 2, 3, 4, 65535, 65534], dtype=np.uint64)
+    got_zz = zigzag(s)
+    assert np.array_equal(got_zz, expected_zz), \
+        f"zigzag KAT failed: got {got_zz}, expected {expected_zz}"
+    assert np.array_equal(unzigzag(got_zz), s), "unzigzag does not invert zigzag"
+
+    # 2) Rice coder: decode the PRODUCTION encoder's real byte output with an
+    # INDEPENDENTLY WRITTEN decoder (no shared code) across varied residual
+    # arrays and block-boundary-adjacent lengths -- catches a bug that a
+    # same-module round-trip (encode/decode sharing an assumption) would miss.
+    test_lengths = [0, 1, BLOCK - 1, BLOCK, BLOCK + 1, 2 * BLOCK + 7]
+    for n in test_lengths:
+        for scale in (0, 1, 15, 400, 32000):
+            res = (rng.normal(0, max(scale, 1), n).round().astype(np.int64)
+                   if n else np.zeros(0, np.int64))
+            res = np.clip(res, -32768, 32767)
+            buf = rice_encode_1d(res)
+            got = _independent_rice_decode(buf)
+            assert got == list(res), (
+                f"independent Rice decoder disagrees with rice_encode_1d's output "
+                f"(n={n}, scale={scale}): this means the encoder is not actually "
+                f"emitting the Golomb-Rice format it claims to")
+            # cross-check against the PRODUCTION decoder too, so a divergence
+            # between the two decoders (rather than a real encoder bug) is
+            # distinguishable from the assertion above
+            prod, _ = rice_decode_1d(buf)
+            assert np.array_equal(prod, res), \
+                f"rice_decode_1d round-trip mismatch (n={n}, scale={scale})"
+
+    # 3) Degenerate sanity floor: an all-zero residual block must Rice-code to
+    # (near) its theoretical minimum -- 1 bit/sample (k=0, q=0 every symbol) plus
+    # the small fixed header -- not silently fall back to something larger due to
+    # a k-selection bug.
+    zeros = np.zeros(4 * BLOCK, np.int64)
+    buf = rice_encode_1d(zeros)
+    bits_per_sample = (len(buf) - 6 - ((4 * BLOCK + BLOCK - 1) // BLOCK) - 4) * 8 / len(zeros)
+    assert bits_per_sample <= 1.05, (
+        f"all-zero residual coded at {bits_per_sample:.3f} bits/sample, "
+        f"expected ~1.0 -- k-selection or stop-bit logic likely broken")
+
+    print("known-answer tests: zigzag KAT, independent Rice decoder cross-check "
+          f"({len(test_lengths)} lengths x 5 scales), all-zero floor -- ALL PASSED")
+
+
+# ---------------------------------------------------------------------------
 def _selftest():
+    _known_answer_tests()
     rng = np.random.default_rng(0)
     x = (rng.normal(0, 15, (16, 2000)).round().astype(np.int16))
     x[3, 500:520] += 400   # a spike

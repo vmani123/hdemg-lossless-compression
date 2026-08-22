@@ -35,8 +35,12 @@ self-contained. Use `ultracode` for this entire cycle.
      combining/extending the existing primitives — welcome **only when rooted in sound
      compression theory** (the mechanism is stated before measuring). Every design still
      faces the non-negotiables below.
-5. When the workflow finishes, read its result + the files it edited. Confirm
-   `./sim/run_sim.sh` is still green (paste it) — the cycle must not touch RTL.
+5. When the workflow finishes, read its result + the files it edited, and confirm
+   the per-candidate lossless round-trip gate stayed green — run
+   `PYTHONPATH=host_tools ./.venv/bin/python research/registry.py --audit` (the
+   thorough gate: known-answer Rice-coder cross-check, synthetic edge cases,
+   real-data round-trips, determinism, degenerate sanity bounds) and paste its
+   output. This repo holds no RTL/emulator — there is no `sim/run_sim.sh` to run.
 
 **NON-NEGOTIABLES** (the workflow enforces these; verify them): lossless only
 (`decode(encode(x))==x`, asserted; the PostToolUse hook blocks lossy round-trips);
