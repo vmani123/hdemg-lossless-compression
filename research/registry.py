@@ -3194,6 +3194,253 @@ def bcxs_decode(buf):
 
 
 # ===========================================================================
+# NEW candidate: MIXED-MOMENT CONTEXT WORD for the headline bias corrector
+# (LMS4bcxm+Rice+xchan_bestpartner) -- `bcxm`.
+# ---------------------------------------------------------------------------
+# ONE SLOT CHANGES. The headline LMS4bc's bias corrector is reused byte-identically
+# -- same 30 buckets, same scale-free quantizer thresholds (0.5x / 1.5x the
+# channel's backward leaky mean |e|), same divisionless leaky-integrator estimator
+# S += e - (S>>5) / mu = (S+16)>>5, same zero side-info, same untouched Rice
+# back-end, same verbatim best-partner front-end and verbatim order-4 sign-sign
+# LMS. The ONLY difference is the CONTENT of one of the three context slots:
+#
+#   LMS4bc  : ctx = q5( e[g,t-1] )  x  q3( e[g,t-2] )                x  sgn( d[parent,t-1] )
+#   bcxm    : ctx = q5( e[g,t-1] )  x  sgn( d[g-1,t-1] - d[g-cols,t-1] ) x  sgn( d[parent,t-1] )
+#
+# 5 x 3 x 2 = 30 buckets in BOTH cases: the bucket BUDGET, the factorization and
+# the bitstream format are pinned; what moves is the context's COMPOSITION.
+#
+# THEORY (P9 refinement, made single-variable). The two shipped correctors win on
+# DISJOINT dataset pairs and index DIFFERENT MOMENTS of the same residual:
+#   * the headline's quantized-magnitude slots index the residual's local SCALE.
+#     The sign-sign LMS's constant +-1 update is not MMSE-optimal, so its fixed
+#     point is offset from the Wiener solution and the resulting non-MMSE offset is
+#     MULTIPLIED by the local signal scale -- E[e | ctx] therefore grows with
+#     activity, which is exactly what a magnitude context resolves.
+#   * `bcxs` proved the spatial residual-GRADIENT SIGN carries real cross-channel
+#     MI after the rank-1 subtract: it indexes the DIRECTION of local activity on
+#     the one axis still carrying MI once the temporal predictor has whitened the
+#     own-channel axis (P1 / P9-refined).
+# To the extent the two statistics are conditionally independent given the
+# residual, I(e; q_mag, q_spatial) ~= I(e; q_mag) + I(e; q_spatial), so at a FIXED
+# bucket count the composed word lowers H(e - E[e|ctx]) further than either parent
+# WITHOUT extra dilution -- P9's context-relevance-vs-context-dilution exchange
+# rate is paid only when buckets MULTIPLY or when a slot is uninformative.
+# The slot deleted is the one P9's theory names as weakest: a SECOND own-channel
+# temporal lag q3(e[g,t-2]), sitting on the axis the order-4 predictor has already
+# whitened (P5's mechanism), so it is a weak index of the residual's bias.
+#
+# This is the single-variable test of whether the two correctors' wins are ADDITIVE
+# or SUBSTITUTES, and it targets the headline's one remaining gap: OTB, where the
+# magnitude context wins (+0.528% over bcxs) and the pure spatial word loses.
+#
+# PREVIOUS-SLICE GRADIENT, deliberately. The gradient is taken at LAG 1 from the
+# CODED residuals d[.,t-1] -- exactly as `bc` already takes its parent bit -- not
+# from the same slice. That keeps the whole corrector a single TIME-MAJOR
+# vectorized channel sweep with NO intra-sample channel chain, so the decoder is
+# `bc`'s verbatim structure and the causality argument is unchanged: every channel's
+# d[.,t-1] is already in the stream when the decoder reaches time t. Off-grid
+# neighbours (column 0 has no left, row 0 has no up) contribute 0, identically and
+# deterministically on both sides; bootstrap d = 0 gives gradient sign 0.
+#
+# WHY THIS IS NOT A RETIRED OR DUPLICATE MECHANISM (required disclosure):
+#   * NOT a bucket-count sweep (the named P9 dead end): the count is PINNED at 30
+#     and the 5x3x2 factorization is unchanged. Only which VARIABLE occupies the
+#     3-level slot moves -- the "propose a new context CLASS, never a new count"
+#     discipline, applied at the finest possible granularity (one slot).
+#   * NOT the RETIRED `xctx` (cycle 9, P5): xctx conditioned the RICE PARAMETER k
+#     on a cross-channel energy context -- a SECOND-MOMENT, back-end lever P5
+#     closed -- and left the residual stream byte-identical. Here the coder is
+#     completely untouched and what is corrected is a FIRST MOMENT of the residual
+#     stream UPSTREAM of it, the same disclosure all three shipped bc codecs make.
+#   * NOT a re-proposal of `bcxs` (registered, kept): bcxs replaced bc_lite's WHOLE
+#     27-bucket SIGN word with three spatial/temporal sign statistics. This changes
+#     exactly ONE slot of the headline's 30-bucket MAGNITUDE word and is the first
+#     codec to hold BOTH winning slot classes -- quantized magnitude AND spatial
+#     gradient sign -- at once.
+#   * NOT a widened backward search (P7): nothing is selected or argmin'd; there is
+#     no option set for the winner's curse to act on.
+#
+# EMBEDDABILITY (cost_model.md): state is LMS4bc's MINUS one register -- 30 x int32
+# leaky accumulators (120 B) + one leaky abs(e) scale + e[t-1] + d[t-1] (~132 B/ch,
+# ~17 KB at 128 ch); the e[t-2] register is freed by the swap. Ops: LMS4bc's, plus
+# two loads of neighbour d[.,t-1] from the slice register file, one subtract and one
+# sign test to form the gradient, minus the two compares (and the register shift)
+# freed by dropping q2 -- net ~+1 op/sample-ch. NO multiply, NO divide, NO side-info,
+# NO new state class. LMS4bc already passes both the 1875-cyc sEMG and the 125-cyc
+# neural budget, so this does too.
+#
+# HONEST RISK, stated before measuring: if the two correctors' wins are SUBSTITUTES
+# rather than additive, expect a tie with the better parent on each set (still a
+# P9-sharpening result). On the CapgMyo differential control expect the spatial slot
+# to cost roughly what bcxs paid there (-0.045 pp) -- there is no neighbour MI for
+# it to index -- which is exactly what an MI-gated variant would exist to recover.
+# ===========================================================================
+BCXM_MAGIC = 0x4D58      # 'XM' (mixed-moment context word, bias corrector)
+BCXM_ORDER = BC_ORDER    # temporal predictor stays order-4 (INSIGHTS P2)
+BCXM_NQ1 = BC_NQ1        # 5 quantized-magnitude levels of e[g,t-1] (verbatim from bc)
+BCXM_NQS = 3             # 3 spatial-gradient-sign levels (replaces bc's q3(e[t-2]))
+BCXM_NCTX = BCXM_NQ1 * BCXM_NQS * 2     # 30 buckets -- identical budget to BC_NCTX
+
+
+def _bcxm_neighbours(C, cols):
+    """Raster left/up neighbour index vectors for the C-channel grid, -1 off-grid.
+    Pure geometry, known to both sides from the header (cols, C) -- no side-info."""
+    g = np.arange(C, dtype=np.int64)
+    li = np.where((g % cols) != 0, g - 1, -1)          # same row, previous column
+    ui = np.where(g >= cols, g - cols, -1)             # same column, previous row
+    return li, ui
+
+
+def _bcxm_context(e1, sabs, grad, dpar):
+    """Mixed-moment context index in [0, BCXM_NCTX) from causally-available data.
+
+    Slot 1 (MAGNITUDE, verbatim from _bc_context): q1(e[g,t-1]) in 0..4 with
+      scale-free thresholds 0.5x / 1.5x the channel's backward leaky mean |e|
+      (T = sabs >> BC_ABS_W), so a residual is "large" relative to the channel's
+      own current activity, not an absolute number.
+    Slot 2 (SPATIAL, the one changed slot): sgn(d[g-1,t-1] - d[g-cols,t-1]) in 0..2
+      -- the discrete spatial derivative of the previous slice's coded residual
+      field across the electrode array.
+    Slot 3 (PARENT, verbatim from _bc_context): sign of the best-partner parent's
+      previous coded residual, in 0..1.
+    Bootstrap (T = 0, d = 0) degenerates deterministically and identically on both
+    sides. All integer compares -- no multiplies, no divides."""
+    T = sabs >> np.int64(BC_ABS_W)
+    t1 = T >> np.int64(1)            # 0.5 * mean|e|
+    t2 = T + t1                      # 1.5 * mean|e|
+    q1 = np.full(e1.size, 2, np.int64)
+    q1[e1 < -t1] = 1
+    q1[e1 < -t2] = 0
+    q1[e1 > t1] = 3
+    q1[e1 > t2] = 4
+    qs = np.sign(grad) + np.int64(1)                  # 0 / 1 / 2 (one sign test)
+    s = (dpar < 0).astype(np.int64)
+    return (q1 * BCXM_NQS + qs) * 2 + s
+
+
+def _bcxm_grad(dprev, lsrc, has_l, usrc, has_u):
+    """Previous-slice spatial residual gradient d[left,t-1] - d[up,t-1], per channel.
+    Off-grid neighbours contribute 0. One gather pair and one subtract."""
+    gl = np.where(has_l, dprev[lsrc], 0)
+    gu = np.where(has_u, dprev[usrc], 0)
+    return gl - gu
+
+
+def _bcxm_forward(x, parents, cols, order=BCXM_ORDER, shift=BC_SHIFT):
+    """Order-4 sign-sign LMS (stage 1, verbatim rule) + per-context running-mean
+    bias cancellation on the MIXED-MOMENT context word (stage 2). Structurally
+    _bc_forward with the q2(e[t-2]) slot replaced by the previous-slice spatial
+    residual-gradient sign; everything else -- estimator, update order, LMS
+    adaptation on the PRE-correction residual -- is byte-identical."""
+    C, N = x.shape
+    x = x.astype(np.int64)
+    par = np.asarray(parents, np.int64)
+    has_par = par >= 0
+    psrc = np.where(has_par, par, 0)           # safe gather index for root channels
+    li, ui = _bcxm_neighbours(C, cols)
+    has_l, has_u = li >= 0, ui >= 0
+    lsrc = np.where(has_l, li, 0)
+    usrc = np.where(has_u, ui, 0)
+    w = np.zeros((C, order), np.int64)
+    hist = np.zeros((C, order), np.int64)      # past reconstructed samples
+    S = np.zeros((C, BCXM_NCTX), np.int64)     # per-context leaky bias accumulators
+    sabs = np.zeros(C, np.int64)               # leaky mean-|e| scale (context thresholds)
+    e1 = np.zeros(C, np.int64)                 # raw residual e[t-1]
+    dprev = np.zeros(C, np.int64)              # CODED residual d[t-1] (per channel)
+    res = np.empty((C, N), np.int64)
+    ci = np.arange(C)
+    for t in range(N):
+        pred = (w * hist).sum(axis=1) >> shift
+        e = x[:, t] - pred                      # stage-1 (LMS) residual
+        grad = _bcxm_grad(dprev, lsrc, has_l, usrc, has_u)
+        ctx = _bcxm_context(e1, sabs, grad, np.where(has_par, dprev[psrc], 0))
+        acc = S[ci, ctx]
+        mu = (acc + BC_MU_RND) >> np.int64(BC_MU_W)     # E[e|ctx], shift-divide
+        d = e - mu                              # stage-2 (bias-cancelled) residual
+        res[:, t] = d
+        # running-mean update on the RAW residual -> mu tracks E[e|ctx] directly
+        S[ci, ctx] = acc + e - (acc >> np.int64(BC_MU_W))
+        # stage-1 adaptation is UNCHANGED: it sees the pre-correction e
+        w += np.sign(e)[:, None] * np.sign(hist)
+        sabs += np.abs(e) - (sabs >> np.int64(BC_ABS_W))
+        e1 = e
+        dprev = d
+        hist[:, 1:] = hist[:, :-1]
+        hist[:, 0] = x[:, t]
+    return res
+
+
+def _bcxm_inverse(res, parents, cols, order=BCXM_ORDER, shift=BC_SHIFT):
+    """Exact inverse of _bcxm_forward. At time t the decoder holds d[.,t] for every
+    channel from the stream and d[.,t-1] from the previous iteration, so the whole
+    context word -- magnitude slot from the recovered e[t-1], spatial slot from the
+    previous slice's coded residuals, parent slot as before -- is formed from data
+    strictly before t. Every table updates identically on both sides. Zero side-info."""
+    C, N = res.shape
+    res = res.astype(np.int64)
+    par = np.asarray(parents, np.int64)
+    has_par = par >= 0
+    psrc = np.where(has_par, par, 0)
+    li, ui = _bcxm_neighbours(C, cols)
+    has_l, has_u = li >= 0, ui >= 0
+    lsrc = np.where(has_l, li, 0)
+    usrc = np.where(has_u, ui, 0)
+    w = np.zeros((C, order), np.int64)
+    hist = np.zeros((C, order), np.int64)
+    S = np.zeros((C, BCXM_NCTX), np.int64)
+    sabs = np.zeros(C, np.int64)
+    e1 = np.zeros(C, np.int64)
+    dprev = np.zeros(C, np.int64)
+    x = np.empty((C, N), np.int64)
+    ci = np.arange(C)
+    for t in range(N):
+        pred = (w * hist).sum(axis=1) >> shift
+        grad = _bcxm_grad(dprev, lsrc, has_l, usrc, has_u)
+        ctx = _bcxm_context(e1, sabs, grad, np.where(has_par, dprev[psrc], 0))
+        acc = S[ci, ctx]
+        mu = (acc + BC_MU_RND) >> np.int64(BC_MU_W)
+        d = res[:, t]
+        e = d + mu                              # undo stage 2
+        xt = pred + e                           # undo stage 1
+        x[:, t] = xt
+        S[ci, ctx] = acc + e - (acc >> np.int64(BC_MU_W))
+        w += np.sign(e)[:, None] * np.sign(hist)
+        sabs += np.abs(e) - (sabs >> np.int64(BC_ABS_W))
+        e1 = e
+        dprev = d
+        hist[:, 1:] = hist[:, :-1]
+        hist[:, 0] = xt
+    return x
+
+
+def bcxm_encode(x, cols=16):
+    x = np.asarray(x, np.int64)
+    C, N = x.shape
+    xt, parents, betas = _bp_select(x, cols)     # proven best-partner front-end (verbatim)
+    res = _bcxm_forward(xt, parents, cols)       # LMS4 + mixed-moment bias cancellation
+    body = b"".join(ec.rice_encode_1d(res[c]) for c in range(C))
+    hdr = struct.pack("<HHII", BCXM_MAGIC, cols, C, N)
+    side = parents.astype("<i2").tobytes() + betas.astype("<i2").tobytes()
+    return hdr + side + body
+
+
+def bcxm_decode(buf):
+    magic, cols, C, N = struct.unpack_from("<HHII", buf, 0)
+    assert magic == BCXM_MAGIC, "bad mixed-moment-context bias codec magic"
+    off = 12
+    parents = np.frombuffer(buf, "<i2", C, off).astype(np.int64); off += 2 * C
+    betas = np.frombuffer(buf, "<i2", C, off).astype(np.int64); off += 2 * C
+    res = np.empty((C, N), np.int64)
+    for c in range(C):
+        arr, off = ec.rice_decode_1d(buf, off)
+        res[c] = arr
+    xt = _bcxm_inverse(res, parents, cols)       # matched two-stage inverse
+    x = _bp_inverse(xt, parents, betas)
+    return x.astype(np.int16)
+
+
+# ===========================================================================
 # NEW candidate: propagation-aware (TIME-LAGGED) cross-channel predictor
 # (LMS4+Rice+xchan_xlag).
 # ---------------------------------------------------------------------------
@@ -4487,6 +4734,454 @@ def vsbp_decode(buf):
 
 
 # ===========================================================================
+# NEW candidate: COMPOSITE (noise-averaged) PARENT with ONE fitted gain
+# (LMS4+Rice+xchan_cmean) -- `cmean`.
+# ---------------------------------------------------------------------------
+# The spatial front-end is attacked on a NEW axis: not the SIZE of the
+# hypothesis class (how many parents, which parent, what lag -- P6/P7/P1b all
+# live there) but the QUALITY (SNR) of the single regressor the rank-1 subtract
+# is fitted against. Model each causal grid neighbour as
+#
+#       x_i[t] = s[t] + n_i[t]
+#
+# a SHARED volume-conducted mode s (P6 settled that it arrives INSTANTANEOUSLY,
+# i.e. neighbours are in phase, so they may be summed with NO lag search) plus an
+# approximately independent local part n_i. Regressing the target on ONE
+# neighbour is textbook errors-in-variables: the least-squares gain is ATTENUATED
+# by SNR/(1+SNR) and the achievable residual variance is bounded below by
+# sigma^2 (1 - rho^2 * SNR/(1+SNR)) -- the REGRESSOR's own noise directly caps how
+# much of the shared mode ANY rank-1 subtract can remove, no matter how well beta
+# is fitted. Averaging K in-phase neighbours multiplies the regressor's SNR by
+# ~K (the shared mode adds coherently, the independent parts add in power), which
+# raises rho_eff^2 and lowers the attainable residual variance; the coded rate
+# falls by ~1/2 log2 of that variance ratio. Crucially this SHRINKS the free
+# parameter count instead of growing it: ONE gain and ZERO selection, versus
+# best-partner's (parent index + gain) -- so it attacks P7's binding constraint
+# (selection variance) from the opposite side: LOWER estimator variance at FIXED
+# model order.
+#
+# Mechanism (per channel g, per block i>0, all backward-adaptive, zero side-info):
+#   1. SIGNS. Over the PREVIOUS already-reconstructed RAW block, take the sign of
+#      the dot product <x_g, x_i> for each of the K=4 FIXED causal grid slots
+#      (left, up, up-left, up-right; off-grid slots contribute 0 and have no
+#      sign). s_i = +1 if the dot product is >= 0 else -1. This is an ALIGNMENT
+#      sign, not a selection: it only prevents an anti-correlated neighbour from
+#      cancelling the shared mode inside the sum (the load-bearing detail on a
+#      DIFFERENTIAL array such as CapgMyo, where neighbouring differential pairs
+#      can be in antiphase).
+#   2. COMPOSITE PARENT. m[g,t] = (sum_i s_i * x[i,t]) >> log2(K), with K=4 the
+#      FIXED slot count (off-grid slots contribute 0, so an edge channel simply
+#      gets a smaller-amplitude composite -- the fitted gain absorbs the scale).
+#      One virtual parent, formed with 3 adds + 1 shift after the sign applies.
+#   3. ONE FITTED GAIN. beta_g = rounded integer least squares of x_g on m over
+#      the SAME previous block (`_bp_opt_beta`, the family's verbatim integer-LS
+#      gain, same BP_SHIFT fixed-point scale). Applied to the CURRENT block:
+#      y[g,t] = x[g,t] - ((beta_g * m[g,t]) >> shift). Parents are left BIT-CLEAN
+#      (asymmetric rank-1 residual-only injection, the robustness property
+#      INSIGHTS P3 credits the rank-1 subtract with). beta_g == 0 degrades
+#      gracefully to the identity -- that is the codec's ONLY "off" path, and it
+#      is a fitted zero, not a scored selection.
+#   4. BOOTSTRAP: block 0 has no previous block, so it is coded as-is; block 1
+#      onward re-fits. Every candidate slot has grid index < g and the previous
+#      block is bit-identically reconstructed on both sides, so the decoder
+#      recomputes the SAME signs and the SAME beta -> ZERO side-info,
+#      look-ahead 0 (INSIGHTS P4).
+# Behind the front-end: the verbatim order-4 sign-sign LMS (INSIGHTS P2) and the
+# verbatim adaptive Golomb-Rice back-end (P5) -- nothing else moves, so the
+# measured delta is attributable to the composite regressor alone.
+#
+# NOT a retired mechanism:
+#   - NOT `xchan_multiparent` (retired): that summed TWO INDEPENDENTLY FITTED
+#     MARGINAL rank-1 subtracts, so beta_1 + beta_2 ~ 2*beta double-counted the
+#     parents' shared mode and over-subtracted. Here there is ONE regressor and
+#     ONE gain fitted AGAINST IT -- the exact least-squares solution in the
+#     equal-weight direction, which structurally CANNOT over-subtract (the LS
+#     residual is orthogonal to m by construction).
+#   - NOT `xchan_hint` / P11: no parity split (every channel keeps its full
+#     dist-1 causal neighbourhood) and the gain is FITTED, not unity/convex --
+#     P11's stated escape hatch is precisely a fitted-gain multi-neighbour form.
+#   - NOT `xchan_jointbp2`: that is 2 free taps PLUS a pair search; this is 1 tap
+#     and NO search -- the opposite corner of the same bias/variance trade.
+#   - NOT `iklt`/`iklt_adaptive` (P3): predict-only, one rank-1 removal, parents
+#     untouched; no energy-preserving rotation, nothing corrupts a parent row.
+#   - NOT a P6 lag search: the composite is formed at lag 0 only, which is what
+#     P6 settled the physics to be.
+# DECLARED PARTIAL REVIVAL: the retired always-on `acar+bestpartner` also
+# subtracts a mean of many channels -- but GLOBALLY (whole array) and at UNITY
+# gain. This one is LOCAL (P1: shared content on large arrays is spatially local)
+# and FITTED (so where no shared mode exists beta -> 0 and the stage vanishes,
+# instead of injecting the array mean's noise); unity gain is exactly the
+# mis-specification P11 diagnosed.
+# RISKS TO MEASURE: (i) where ONE dominant neighbour carries nearly all the MI
+# (P1b: tight arrays are essentially rank-1) the average DILUTES that parent --
+# expect neutral rather than negative, since beta re-fits against whatever m is;
+# (ii) on the CapgMyo differential control the alignment signs are load-bearing --
+# if they are mis-estimated the composite partially cancels and the codec decays
+# toward having NO spatial stage, which P11 showed is worse than best-partner.
+# CITATIONS: W. A. Fuller, Measurement Error Models (Wiley 1987) for the
+# attenuation / regression-dilution result (textbook, unverified on this corpus);
+# Dolby TrueHD/MLP integer channel matrixing (US 7,392,195 / US 8,239,210) as the
+# shipping precedent for predicting a channel from a COMBINATION of channels
+# (patent-reported, unverified here); D. Rzepka, Biomed. Signal Process. Control
+# 57:101705 (2020), cross-channel pairing as a second decorrelation stage in a
+# low-complexity multichannel biosignal coder (paper-reported, unverified here).
+# ===========================================================================
+XCM_MAGIC = 0x434D        # 'CM' (composite-mean virtual parent)
+XCM_BLOCK = ec.BLOCK      # re-fit block (aligns with the Rice block)
+XCM_SHIFT = BP_SHIFT      # same fixed-point gain scale as the whole xchan family
+XCM_LOG2K = 2             # K = 4 FIXED neighbour slots -> composite shift
+XCM_ORDER = LMS4_ORDER    # order-4 temporal base behind the spatial front-end (P2)
+
+
+def _xcm_slots(g, cols, C):
+    """The K=4 FIXED causal grid-neighbour SLOTS of channel g, in a fixed order
+    (left, up, up-left, up-right). -1 = off-grid: that slot contributes 0 to the
+    composite (it is NOT dropped, so the >> log2(K) normalization is a constant
+    shift and an edge channel just gets a smaller composite, which the fitted
+    gain absorbs). Every live slot has grid index < g, so the decoder has the
+    whole row reconstructed before it reaches g."""
+    r, c = divmod(g, cols)
+    return (
+        g - 1 if c > 0 else -1,                          # left
+        g - cols if r > 0 else -1,                       # up
+        g - cols - 1 if (r > 0 and c > 0) else -1,       # up-left
+        g - cols + 1 if (r > 0 and c < cols - 1) else -1,  # up-right
+    )
+
+
+def _xcm_signs(x, g, slots, ps, pe):
+    """Backward ALIGNMENT signs s_i in {+1,-1} for each live slot, from the
+    PREVIOUS already-reconstructed block [ps,pe): s_i = +1 if <x_g, x_i> >= 0
+    else -1. Integer-only and deterministic, so encoder and decoder -- which hold
+    the bit-identical previous block -- derive the identical signs. Off-grid
+    slots get 0 (no contribution)."""
+    xg = x[g, ps:pe]
+    out = []
+    for p in slots:
+        if p < 0:
+            out.append(0)
+        else:
+            out.append(1 if int((xg * x[p, ps:pe]).sum()) >= 0 else -1)
+    return out
+
+
+def _xcm_composite(x, slots, signs, s, e):
+    """The single virtual parent m[t] = (sum_i s_i * x[i,t]) >> log2(K) over the
+    K=4 fixed slots (off-grid contribute 0). Arithmetic shift on int64 -> exact
+    and identical on both sides."""
+    acc = np.zeros(e - s, np.int64)
+    for p, sg in zip(slots, signs):
+        if p >= 0 and sg:
+            acc += sg * x[p, s:e]
+    return acc >> XCM_LOG2K
+
+
+def _xcm_forward(x, cols, B=XCM_BLOCK):
+    """Rank-1 subtract of ONE composite (noise-averaged) parent with ONE
+    backward-fitted integer-LS gain. Block i's (signs, beta) come from the
+    PREVIOUS raw block; block 0 is coded as-is. Returns the transformed [C, N]
+    int64 array; parent rows are never modified."""
+    C, N = x.shape
+    x = x.astype(np.int64)
+    y = x.copy()
+    nblocks = (N + B - 1) // B
+    for g in range(C):
+        slots = _xcm_slots(g, cols, C)
+        if all(p < 0 for p in slots):        # grid origin: no causal neighbour
+            continue
+        for i in range(1, nblocks):          # block 0 has no prior block
+            s, e = i * B, min((i + 1) * B, N)
+            ps, pe = (i - 1) * B, i * B
+            signs = _xcm_signs(x, g, slots, ps, pe)
+            mprev = _xcm_composite(x, slots, signs, ps, pe)
+            b = _bp_opt_beta(x[g, ps:pe], mprev, XCM_SHIFT)
+            if b == 0:                       # fitted zero -> stage is the identity
+                continue
+            m = _xcm_composite(x, slots, signs, s, e)
+            y[g, s:e] = x[g, s:e] - ((b * m) >> XCM_SHIFT)
+    return y
+
+
+def _xcm_inverse(y, cols, B=XCM_BLOCK):
+    """Invert _xcm_forward. Every slot has grid index < g so its row is fully
+    reconstructed before g; within a channel we rebuild block-by-block in time
+    order, so block i-1 is restored before block i and the SAME (signs, beta) are
+    recomputed from it -- mirroring the encoder exactly."""
+    C, N = y.shape
+    y = y.astype(np.int64)
+    x = y.copy()
+    nblocks = (N + B - 1) // B
+    for g in range(C):
+        slots = _xcm_slots(g, cols, C)
+        if all(p < 0 for p in slots):
+            continue
+        for i in range(1, nblocks):
+            s, e = i * B, min((i + 1) * B, N)
+            ps, pe = (i - 1) * B, i * B
+            signs = _xcm_signs(x, g, slots, ps, pe)
+            mprev = _xcm_composite(x, slots, signs, ps, pe)
+            b = _bp_opt_beta(x[g, ps:pe], mprev, XCM_SHIFT)
+            if b == 0:
+                continue
+            m = _xcm_composite(x, slots, signs, s, e)
+            x[g, s:e] = y[g, s:e] + ((b * m) >> XCM_SHIFT)
+    return x
+
+
+def xcm_encode(x, cols=16):
+    x = np.asarray(x, np.int64)
+    C, N = x.shape
+    y = _xcm_forward(x, cols)                        # composite-parent rank-1 subtract
+    res = ec.lms_forward(y, order=XCM_ORDER)         # order-4 sign-sign LMS (P2)
+    body = b"".join(ec.rice_encode_1d(res[c]) for c in range(C))
+    hdr = struct.pack("<HHII", XCM_MAGIC, cols, C, N)   # NO (sign,beta) side-info
+    return hdr + body
+
+
+def xcm_decode(buf):
+    magic, cols, C, N = struct.unpack_from("<HHII", buf, 0)
+    assert magic == XCM_MAGIC, "bad composite-mean xchan codec magic"
+    off = 12
+    res = np.empty((C, N), np.int64)
+    for c in range(C):
+        arr, off = ec.rice_decode_1d(buf, off)
+        res[c] = arr
+    y = ec.lms_inverse(res, order=XCM_ORDER)         # matched order-4 inverse
+    x = _xcm_inverse(y, cols)
+    return x.astype(np.int16)
+
+
+# ===========================================================================
+# NEW candidate: CROSS-CHANNEL POOLED (SHRUNK) BIAS STATISTICS
+# (LMS4bcpool+Rice+xchan_bestpartner) -- INSIGHTS P9's refinement attacked on its
+# stated binding constraint: not WHICH context, but how well each bucket's mean is
+# ESTIMATED.
+# ---------------------------------------------------------------------------
+# P9's refinement names the constraint exactly: "context relevance is bought with
+# context DILUTION". A 30-bucket corrector estimates each mu[c,q] from roughly
+# 1/NCTX of ONE channel's samples, so what caps the stage is ESTIMATION VARIANCE,
+# not the available mutual information. This candidate therefore holds the context
+# CLASS, the bucket COUNT (30), the per-channel update LAW and the bitstream layout
+# byte-identical to the shipped `LMS4bc+Rice+xchan_bestpartner` (`_bc_context` and
+# the per-channel leaky integrator are reused VERBATIM) and changes exactly ONE
+# thing: the ESTIMATOR's sample support.
+#
+# MECHANISM (one added array-wide table, integer, divisionless, zero side-info):
+#   * alongside the per-channel accumulators S[c,q], keep ONE array-wide leaky
+#     accumulator Sbar[q] fed by EVERY channel's residual that lands in bucket q;
+#   * read both means with the family's rounded shift-divide,
+#         mu_c   = (S[c,q] + 2^(W-1)) >> W                (W = BC_MU_W = 5)
+#         mu_bar = (Sbar[q] + 2^(Wp-1)) >> Wp             (Wp = BCPOOL_W = 9)
+#     and SHRINK toward the pooled value with a FIXED power-of-two weight
+#         mu = ((2^w - 1) * mu_c + mu_bar) >> w,   w = BCPOOL_SHR = 2
+#     i.e. mu = (3*mu_c + mu_bar) >> 2 -- one shift+add for the 3x, one add, one
+#     shift. Nothing is selected and w is a compile-time constant, so there is no
+#     argmin and no winner's-curse surface (INSIGHTS P7);
+#   * the pooled table updates at the END of each time slice, from the per-slice
+#     bucket sums/counts: Sbar[q] += tot[q] - cnt[q]*(Sbar[q] >> Wp), where
+#     Sbar on the right is the PRE-slice value every channel already read. So the
+#     estimate used at time t depends only on slices < t, the update is
+#     channel-ORDER-INDEPENDENT, and encoder and decoder run the identical
+#     recursion off identical reconstructed data (P4: zero side-info).
+#
+# WHY IT SHOULD PAY (Stein / empirical Bayes). Each mu_c[q] is a mean of ~2^W
+# effective samples, so its estimation variance is ~sigma^2/2^W; the pooled mean
+# multiplies the sample support by the channel count (128-320 here), cutting the
+# variance of that term by the same factor at the price of a BIAS equal to the
+# channel's deviation from the array-mean bias. James-Stein / Efron-Morris states
+# the condition precisely: a convex combination of the per-channel and pooled
+# estimates has STRICTLY LOWER MSE than the per-channel estimate alone whenever the
+# between-channel spread of the true E[e|ctx] is small relative to the per-channel
+# estimation variance -- which is the small-correction, few-samples-per-bucket
+# regime this stage demonstrably occupies (shipped corrections are int8-clamped and
+# worth tenths of a percent). A lower-MSE estimate of E[e|ctx] subtracts closer to
+# the true conditional mean, so the law of total variance bites harder and
+# H(e - mu) falls further. Secondary, orthogonal payoff: it RELAXES the dilution
+# constraint that currently bounds how rich a context this pipeline can afford.
+#
+# WHY THIS IS NOT A RETIRED OR DUPLICATE MECHANISM (required disclosure):
+#   * NOT a bucket-count sweep and NOT a new context class -- the two axes P9's
+#     refinement explicitly closes/redirects are BOTH held fixed and bit-identical
+#     to `LMS4bc`. The only changed quantity is the estimator's sample support.
+#   * NOT `LMS4rs` (retired, P2): that SPLIT adaptation data across per-regime
+#     predictor coefficient banks, fragmenting estimation. This MERGES estimation
+#     data across channels -- the opposite operation -- and it acts on a single
+#     scalar mean, not on a 4-tap filter, so it cannot fragment anything.
+#   * NOT `xctx` (retired, P5): the coder is untouched (one global adaptive-Rice
+#     back-end, no context-split k model); what is pooled is a FIRST MOMENT of the
+#     residual upstream of the coder.
+#   * NOT a P7 backward argmin: nothing is scored or selected; the shrinkage weight
+#     is a fixed constant, so no selection bias/variance is introduced.
+#   * NOT the retired always-on global CAR (`acar+bestpartner`): that averaged the
+#     SIGNAL across channels and subtracted it at unity gain. Here the signal path,
+#     the spatial front-end and the predictor are untouched -- what is averaged
+#     across channels is a per-context STATISTIC of the residual.
+#
+# EMBEDDABILITY (cost_model.md): incumbent state + ONE array-wide table --
+# 30 int32 leaky accumulators + 30 int32 slice sums + 30 uint16 slice counts
+# ~ 300 B TOTAL FOR THE WHOLE ARRAY (~3 B/ch at 128 ch, ~1 B/ch at 320), versus
+# the 120 B/CH the per-channel tables already cost. Per sample-channel: 1 add and
+# 1 count increment into the slice bins, 1 gather of the snapshot mean, and 4 ops
+# for the shrinkage combine; the end-of-slice recursion costs ~5 ops per touched
+# bucket, i.e. ~30*5/C ~ 1 op/sample-channel at 128 ch. One small multiply per
+# bucket per slice (cnt*(Sbar>>Wp)); NO divides, no look-ahead, zero side-info.
+#
+# STABILITY of the pooled recursion: the per-slice leak factor is cnt/2^Wp, so the
+# recursion contracts for any per-bucket occupancy cnt < 2^Wp = 512 -- satisfied by
+# construction for every array this project targets (C <= 320, and cnt <= C).
+#
+# HONEST RISK (recorded before measuring): channel amplitude heterogeneity --
+# electrode impedance and distance to the innervation zone, the physical
+# non-uniformity P11 named -- biases the pooled mean, and pooling a statistic
+# across channels whose true conditional means genuinely differ is exactly the
+# regime where Stein shrinkage stops helping. The fixed w=2 weight bounds the
+# damage by keeping the per-channel estimate dominant (3/4). A null or small
+# negative is a real outcome and would be evidence that the per-context bias is
+# channel-SPECIFIC rather than array-wide.
+# ===========================================================================
+BCPOOL_MAGIC = 0x4350    # 'CP' (cross-channel pooled bias statistics)
+BCPOOL_W = 9             # leaky window of the ARRAY-WIDE mean (2^9 = 512 hits)
+BCPOOL_RND = 1 << (BCPOOL_W - 1)     # round-half-up constant for the pooled read
+BCPOOL_SHR = 2           # shrinkage weight w: mu = ((2^w - 1)*mu_c + mu_bar) >> w
+
+
+def _bcpool_mu(acc, sbar_ctx):
+    """Shrunk per-context mean: ((2^w - 1)*mu_c + mu_bar) >> w, integer only.
+
+    mu_c is the incumbent's per-channel rounded shift-divide read (VERBATIM);
+    mu_bar is the same read of the array-wide accumulator at a wider window. The
+    3x is a shift+add, so the whole combine is shifts/adds -- no multiply, no
+    divide. Identical on both sides."""
+    mu_c = (acc + BC_MU_RND) >> np.int64(BC_MU_W)
+    mu_b = (sbar_ctx + BCPOOL_RND) >> np.int64(BCPOOL_W)
+    return (((mu_c << np.int64(BCPOOL_SHR)) - mu_c) + mu_b) >> np.int64(BCPOOL_SHR)
+
+
+def _bcpool_slice_update(Sbar, ctx, e):
+    """END-OF-SLICE pooled update, from the per-slice bucket sums and counts.
+
+    Every channel in the slice read the SAME pre-slice Sbar, so the estimate at
+    time t depends only on slices < t and the update is independent of channel
+    order -- which is what lets the vectorized host loop and a sequential on-node
+    loop (accumulate per bucket during the slice, one leaky step per touched
+    bucket at the end) produce bit-identical state. Pure integer: np.add.at, not
+    bincount-with-weights (that would go through float64)."""
+    tot = np.zeros(BC_NCTX, np.int64)
+    np.add.at(tot, ctx, e)
+    cnt = np.bincount(ctx, minlength=BC_NCTX).astype(np.int64)
+    Sbar += tot - cnt * (Sbar >> np.int64(BCPOOL_W))
+
+
+def _bcpool_forward(x, parents, order=BC_ORDER, shift=BC_SHIFT):
+    """`_bc_forward` with ONE change: mu is the shrunk (per-channel, pooled)
+    estimate instead of the per-channel one. Stage 1 (order-4 sign-sign LMS),
+    the context function, the bucket count and the per-channel accumulator law
+    are all verbatim, so the measured delta isolates the ESTIMATOR."""
+    C, N = x.shape
+    x = x.astype(np.int64)
+    par = np.asarray(parents, np.int64)
+    has_par = par >= 0
+    psrc = np.where(has_par, par, 0)           # safe gather index for root channels
+    w = np.zeros((C, order), np.int64)
+    hist = np.zeros((C, order), np.int64)      # past reconstructed samples
+    S = np.zeros((C, BC_NCTX), np.int64)       # per-channel leaky bias accumulators
+    Sbar = np.zeros(BC_NCTX, np.int64)         # ONE array-wide pooled accumulator
+    sabs = np.zeros(C, np.int64)               # leaky mean-|e| scale (context thresholds)
+    e1 = np.zeros(C, np.int64)                 # raw residual e[t-1]
+    e2 = np.zeros(C, np.int64)                 # raw residual e[t-2]
+    dprev = np.zeros(C, np.int64)              # CODED residual d[t-1] (per channel)
+    res = np.empty((C, N), np.int64)
+    ci = np.arange(C)
+    for t in range(N):
+        pred = (w * hist).sum(axis=1) >> shift
+        e = x[:, t] - pred                      # stage-1 (LMS) residual
+        ctx = _bc_context(e1, e2, sabs, np.where(has_par, dprev[psrc], 0))
+        acc = S[ci, ctx]
+        mu = _bcpool_mu(acc, Sbar[ctx])         # SHRUNK E[e|ctx]
+        d = e - mu                              # stage-2 (bias-cancelled) residual
+        res[:, t] = d
+        S[ci, ctx] = acc + e - (acc >> np.int64(BC_MU_W))
+        _bcpool_slice_update(Sbar, ctx, e)      # pooled table: AFTER every read
+        # stage-1 adaptation is UNCHANGED: it sees the pre-correction e
+        w += np.sign(e)[:, None] * np.sign(hist)
+        sabs += np.abs(e) - (sabs >> np.int64(BC_ABS_W))
+        e2 = e1
+        e1 = e
+        dprev = d
+        hist[:, 1:] = hist[:, :-1]
+        hist[:, 0] = x[:, t]
+    return res
+
+
+def _bcpool_inverse(res, parents, order=BC_ORDER, shift=BC_SHIFT):
+    """Exact inverse of `_bcpool_forward`. The decoder forms the same context from
+    data strictly before t, reads the same per-channel AND pooled accumulators,
+    recovers e = d + mu, and only THEN runs the identical per-channel and
+    end-of-slice pooled updates -- so both tables track bit-identically with zero
+    side-info."""
+    C, N = res.shape
+    res = res.astype(np.int64)
+    par = np.asarray(parents, np.int64)
+    has_par = par >= 0
+    psrc = np.where(has_par, par, 0)
+    w = np.zeros((C, order), np.int64)
+    hist = np.zeros((C, order), np.int64)
+    S = np.zeros((C, BC_NCTX), np.int64)
+    Sbar = np.zeros(BC_NCTX, np.int64)
+    sabs = np.zeros(C, np.int64)
+    e1 = np.zeros(C, np.int64)
+    e2 = np.zeros(C, np.int64)
+    dprev = np.zeros(C, np.int64)
+    x = np.empty((C, N), np.int64)
+    ci = np.arange(C)
+    for t in range(N):
+        pred = (w * hist).sum(axis=1) >> shift
+        ctx = _bc_context(e1, e2, sabs, np.where(has_par, dprev[psrc], 0))
+        acc = S[ci, ctx]
+        mu = _bcpool_mu(acc, Sbar[ctx])
+        d = res[:, t]
+        e = d + mu                              # undo stage 2
+        xt = pred + e                           # undo stage 1
+        x[:, t] = xt
+        S[ci, ctx] = acc + e - (acc >> np.int64(BC_MU_W))
+        _bcpool_slice_update(Sbar, ctx, e)
+        w += np.sign(e)[:, None] * np.sign(hist)
+        sabs += np.abs(e) - (sabs >> np.int64(BC_ABS_W))
+        e2 = e1
+        e1 = e
+        dprev = d
+        hist[:, 1:] = hist[:, :-1]
+        hist[:, 0] = xt
+    return x
+
+
+def bcpool_encode(x, cols=16):
+    x = np.asarray(x, np.int64)
+    C, N = x.shape
+    xt, parents, betas = _bp_select(x, cols)     # proven best-partner front-end (verbatim)
+    res = _bcpool_forward(xt, parents)           # LMS4 + POOLED-SHRUNK bias cancellation
+    body = b"".join(ec.rice_encode_1d(res[c]) for c in range(C))
+    hdr = struct.pack("<HHII", BCPOOL_MAGIC, cols, C, N)
+    side = parents.astype("<i2").tobytes() + betas.astype("<i2").tobytes()
+    return hdr + side + body                     # layout byte-identical to LMS4bc
+
+
+def bcpool_decode(buf):
+    magic, cols, C, N = struct.unpack_from("<HHII", buf, 0)
+    assert magic == BCPOOL_MAGIC, "bad pooled-bias-statistics codec magic"
+    off = 12
+    parents = np.frombuffer(buf, "<i2", C, off).astype(np.int64); off += 2 * C
+    betas = np.frombuffer(buf, "<i2", C, off).astype(np.int64); off += 2 * C
+    res = np.empty((C, N), np.int64)
+    for c in range(C):
+        arr, off = ec.rice_decode_1d(buf, off)
+        res[c] = arr
+    xt = _bcpool_inverse(res, parents)           # matched two-stage inverse
+    x = _bp_inverse(xt, parents, betas)
+    return x.astype(np.int16)
+
+
+# ===========================================================================
 # Uniform codec objects + the registry
 # ===========================================================================
 class Codec:
@@ -5589,6 +6284,96 @@ _register(Codec("LMS4bcxs+Rice+xchan_bestpartner", bcxs_encode, bcxs_decode,
          "(sgn(e[left]-e[up]) x sgn(e[parent]) x sgn(e[t-1]), 27 buckets, "
          "divisionless, zero side-info) + Rice"))
 
+# NEW candidate (this cycle): MIXED-MOMENT CONTEXT WORD for the headline bias
+# corrector (`bcxm`). The headline LMS4bc's corrector is reused byte-identically --
+# 30 buckets, the same scale-free 0.5x/1.5x mean-|e| quantizer, the same
+# divisionless leaky-integrator estimator, the same untouched Rice back-end, the
+# same verbatim best-partner front-end and order-4 sign-sign LMS -- and EXACTLY ONE
+# context slot is swapped: q3(e[g,t-2]) -> sgn(d[g-1,t-1] - d[g-cols,t-1]).
+# Ops/sample-ch versus _BC_XTRA=22: +2 gathers of the neighbour d[.,t-1] from the
+# slice register file, +1 subtract and +1 sign test to form the gradient, -2
+# compares and -1 register shift freed by dropping the q2 slot -> net ~+1, i.e. 23.
+# Still NO multiply and NO divide anywhere in the stage, and no new state class.
+# State/ch is LMS4bc's MINUS the freed e[t-2] register: 30 x int32 accumulators
+# (120 B) + the leaky mean-|e| scale + e[t-1] + d[t-1] -> ~132 B/ch on top of the
+# LMS4 + best-partner state, ~17 KB at 128 ch, far inside the 256 KiB SRAM budget.
+# The decoder runs the byte-identical update on the same reconstructed residual, so
+# the stage costs the same on both sides; dec_ops omits only the encoder-side
+# best-partner neighbour scan, exactly as in the sibling bc codecs.
+_BCXM_XTRA = _BC_XTRA + 1            # +gradient (2 gathers, sub, sign), -q2 compares
+_BCXM_STATE = _BC_STATE - 4          # identical to LMS4bc minus the freed e[t-2] reg
+_BCXM_NOTE = (
+    "MIXED-MOMENT CONTEXT WORD for the headline JPEG-LS/CALIC-style bias corrector. "
+    "The LMS4bc corrector is reused BYTE-IDENTICALLY -- 30 buckets, scale-free "
+    "quantizer thresholds at 0.5x and 1.5x the channel's backward leaky mean |e|, "
+    "divisionless leaky-integrator estimator S += e - (S>>5) read back as "
+    "mu = (S+16)>>5, LMS adaptation on the PRE-correction residual, zero side-info, "
+    "untouched adaptive-Rice back-end, verbatim _bp_select/_bp_inverse front-end and "
+    "verbatim order-4 sign-sign LMS. EXACTLY ONE SLOT CHANGES: "
+    "LMS4bc's ctx = q5(e[g,t-1]) x q3(e[g,t-2]) x sgn(d[parent,t-1]) becomes "
+    "ctx = q5(e[g,t-1]) x sgn(d[g-1,t-1] - d[g-cols,t-1]) x sgn(d[parent,t-1]) -- "
+    "5x3x2 = 30 buckets in BOTH cases, so the bucket BUDGET, the factorization and "
+    "the bitstream format are pinned and only the context's COMPOSITION moves. "
+    "THEORY (P9 refinement, made single-variable): the two shipped correctors win on "
+    "DISJOINT dataset pairs and index DIFFERENT MOMENTS of the same residual. The "
+    "headline's quantized-magnitude slots index the residual's local SCALE -- the "
+    "sign-sign LMS's constant +/-1 update is not MMSE-optimal, its fixed point is "
+    "offset from the Wiener solution, and that non-MMSE offset is MULTIPLIED by the "
+    "local signal scale, so E[e|ctx] grows with activity. bcxs proved the spatial "
+    "residual-GRADIENT SIGN carries real cross-channel MI after the rank-1 subtract: "
+    "it indexes the DIRECTION of local activity on the one axis still carrying MI "
+    "once the temporal predictor has whitened the own-channel axis (P1/P9-refined). "
+    "To the extent the two statistics are conditionally independent, "
+    "I(e; q_mag, q_spatial) ~= I(e; q_mag) + I(e; q_spatial), so at a FIXED bucket "
+    "count the composed word lowers H(e - E[e|ctx]) further than either parent with "
+    "NO extra dilution -- P9's context-relevance-vs-dilution exchange rate is paid "
+    "only when buckets MULTIPLY or when a slot is uninformative. The DELETED slot is "
+    "the one P9's theory names weakest: a SECOND own-channel temporal lag, on the "
+    "axis the order-4 predictor has already whitened (P5's mechanism). This is the "
+    "single-variable test of whether the two correctors' wins are ADDITIVE or "
+    "SUBSTITUTES, and it targets the headline's one remaining gap (OTB, where the "
+    "magnitude context wins and the pure spatial word loses). PREVIOUS-SLICE "
+    "GRADIENT, deliberately: the gradient is taken at LAG 1 from the CODED residuals "
+    "d[.,t-1], exactly as LMS4bc already takes its parent bit, so the corrector stays "
+    "ONE time-major vectorized channel sweep with no intra-sample channel chain and "
+    "the decoder is LMS4bc's verbatim structure -- every channel's d[.,t-1] is "
+    "already in the stream when the decoder reaches time t. Causal, look-ahead 0, "
+    "ZERO side-info (INSIGHTS P4); off-grid neighbours (column 0 has no left, row 0 "
+    "no up) contribute 0 and the d=0 bootstrap gives gradient sign 0, deterministically "
+    "and identically on both sides. DISTINCT FROM THE RETIRED/SHIPPED MECHANISMS: NOT "
+    "a bucket-count sweep (the named P9 dead end) -- the count is PINNED at 30 and the "
+    "5x3x2 factorization is unchanged; only which VARIABLE occupies the 3-level slot "
+    "moves, which is the 'propose a new context CLASS, never a new count' discipline "
+    "applied at the finest possible granularity. NOT the RETIRED xctx (cycle 9, P5), "
+    "which conditioned the RICE PARAMETER k on a cross-channel energy context -- a "
+    "SECOND-MOMENT back-end lever -- and left the residual stream byte-identical; here "
+    "the coder is completely untouched and a FIRST MOMENT of the residual stream is "
+    "corrected UPSTREAM of it, the same disclosure all three shipped bc codecs make. "
+    "NOT a re-proposal of bcxs (registered, kept): bcxs replaced bc_lite's WHOLE "
+    "27-bucket SIGN word; this changes ONE slot of the headline's 30-bucket MAGNITUDE "
+    "word and is the first codec to hold BOTH winning slot classes -- quantized "
+    "magnitude AND spatial gradient sign -- at once. NOT a widened backward search "
+    "(P7): nothing is selected or argmin'd, so the winner's curse has no surface to "
+    "act on. CITATION: Weinberger, Seroussi & Sapiro, LOCO-I/JPEG-LS, IEEE TIP 9(8) "
+    "2000, for the divisionless bias-corrector machinery and the context-word design "
+    "discipline (paper-reported, unverified here); the in-repo basis is the P9 "
+    "refinement. Best-partner selection is derived offline over the whole signal like "
+    "the incumbent (embeddable realization selects per block, look-ahead=block); the "
+    "bias stage itself is pure streaming. HONEST RISK, stated before measuring: if the "
+    "two correctors' wins are SUBSTITUTES rather than additive, expect a tie with the "
+    "better parent on each set (still a P9-sharpening result); on the CapgMyo "
+    "differential control expect the spatial slot to cost about what bcxs paid there "
+    "(-0.045 pp) -- there is no neighbour MI for it to index.")
+_register(Codec("LMS4bcxm+Rice+xchan_bestpartner", bcxm_encode, bcxm_decode, CodecMeta(
+    integer_only=True, enc_ops=_LMS4_OPS + _BCXM_XTRA + _XCHAN_OPS + _BP_SELECT_OPS,
+    dec_ops=_LMS4_OPS + _BCXM_XTRA + _XCHAN_OPS,
+    state_bytes_per_ch=_BCXM_STATE + _BP_STATE, causal=True, lookahead_samples=0,
+    block_size=ec.BLOCK, notes=_BCXM_NOTE), family="temporal",
+    desc="order-4 LMS + LMS4bc's 30-bucket divisionless bias corrector with ONE slot "
+         "swapped to a MIXED-MOMENT word -- q5(e[t-1]) x sgn(d[left,t-1]-d[up,t-1]) x "
+         "sgn(d[parent,t-1]), same 30 buckets, zero side-info -- + Rice, under the "
+         "best-partner front-end"))
+
 # NEW candidate (this cycle): propagation-aware (TIME-LAGGED) cross-channel
 # predictor. Ops/sample-ch on top of the order-4 LMS base (_LMS4_OPS), all counted
 # per sample-channel with the per-block work amortised over B=256:
@@ -6079,6 +6864,227 @@ _register(Codec("LMS4vs+Rice+xchan_bestpartner", vsbp_encode, vsbp_decode,
                    "misadjustment-limited. The residual's remaining excess entropy is a "
                    "context-conditional FIRST moment (removable, P9) not a step-size variance "
                    "term (INSIGHTS P12)."))
+
+
+# NEW candidate (this cycle): COMPOSITE (noise-averaged) PARENT with ONE fitted
+# gain -- `LMS4+Rice+xchan_cmean`. OP COUNT, COUNTED EXPLICITLY (the xlag_v5
+# lesson: never let a selection/fit stage go uncounted), per sample-channel on
+# top of _LMS4_OPS, for the STREAMING encoder:
+#   FORM the composite for the CURRENT sample (every sample of every block i>0):
+#     4 sign-applied accumulates (the sign s_i is CONSTANT across the block, so
+#     each term is one add-or-subtract) + 1 normalizing arithmetic shift + ~3 for
+#     off-grid slot masking/bookkeeping                                 = 8
+#   APPLY the rank-1 subtract: 1 multiply + 1 shift + 1 subtract        = 3
+#   BACKWARD FIT at each block boundary, amortised over the block's samples:
+#     4 alignment dot-products <x_g, x_i> (1 mac each)                  = 4
+#     re-form m over the PREVIOUS block with the new signs              = 8
+#     2 integer-LS accumulators <x_g, m>, <m, m> (1 mac each)           = 2
+#     1 rounded divide + int16 clamp per channel-block (1/BLOCK)        ~ 0
+#                                                                       ---
+#                                              front-end total          = 25
+# -> enc_ops = 26 + 25 = 51 (61 cyc/sample-ch, inside the tight 125-cyc neural
+# budget with room). HONEST COMPARISON, STATED PLAINLY: this is ABOVE, not below,
+# the 13 that LMS4+Rice+xchan_bestpartner_adaptive DECLARES for its 4-candidate
+# scored scan (_XCHAN_OPS + _LMS4BPA_SELECT) -- the hypothesis predicted it would
+# land below. The incumbent's declared 10 covers "<=4-candidate backward scan
+# (2 macs each) + amortised argmin" and does NOT include forming each candidate's
+# cross-residual (3 ops x 4 candidates) or Rice-bit-scoring five residual streams
+# (zigzag + best-k sweep), so an apples-to-apples recount would narrow the gap;
+# that recount is NOT done here (other codecs are not touched) and the honest
+# number for THIS codec is the 25 above, not a number chosen to win the
+# comparison. The composite front-end's real structural saving is a QUALITATIVE
+# one -- there is no argmin at all, so no selection variance (P7) and no
+# per-candidate scoring pass -- not a cycle-count saving.
+# STATE/ch: order-4 LMS weights+history (24) + the current int16 beta (2) + the
+# K=4 alignment sign bits (1) = 27 B, ~3.5 KB at 128 ch. The previous-block
+# sample buffer and the 6 boundary-fit accumulators are SHARED working memory
+# reused per channel-block (the node already buffers a block for the Rice coder's
+# per-block k), so they are noted, not multiplied per channel -- the same
+# convention every backward-adaptive sibling in this file uses.
+_XCM_FORM = 8       # build m for one sample: 4 sign-applied accumulates + shift + masking
+_XCM_APPLY = 3      # 1 mul + 1 shift + 1 sub (identical to _XCHAN_OPS)
+_XCM_FIT = 14       # per-block backward fit, amortised: 4 alignment macs + 8 re-form + 2 LS macs
+_XCM_STATE = _LMS4_STATE + 3    # order-4 LMS + int16 beta + K=4 sign bits
+_XCM_NOTE = (
+    "COMPOSITE (noise-averaged) virtual parent with ONE fitted gain: the spatial "
+    "front-end attacked on the regressor's QUALITY (SNR) axis rather than the "
+    "hypothesis-class-SIZE axis that P1b/P6/P7 all live on. Model each causal grid "
+    "neighbour as x_i = s + n_i: a SHARED volume-conducted mode s -- P6 settled that it "
+    "is INSTANTANEOUS, so neighbours are in phase and may be summed with NO lag search "
+    "-- plus an approximately independent local part n_i. Regressing on ONE neighbour is "
+    "errors-in-variables: the LS gain is ATTENUATED by SNR/(1+SNR) and the achievable "
+    "residual variance is bounded by sigma^2 (1 - rho^2 SNR/(1+SNR)), i.e. the "
+    "REGRESSOR's own noise caps how much of the shared mode ANY rank-1 subtract can "
+    "remove however well beta is fitted. Averaging K in-phase neighbours multiplies "
+    "regressor SNR by ~K (shared mode adds coherently, independent parts add in power), "
+    "raising rho_eff^2 and lowering attainable residual variance; coded rate falls by "
+    "~1/2 log2 of the variance ratio. It SHRINKS the free-parameter count instead of "
+    "growing it -- ONE gain, ZERO selection, vs best-partner's (parent index + gain) -- "
+    "so it attacks P7's binding constraint from the other side: lower estimator variance "
+    "at FIXED model order. MECHANISM per channel g, per block i>0, fully backward: "
+    "(1) SIGNS -- s_i = sign(<x_g, x_i>) over the PREVIOUS already-reconstructed RAW "
+    "block, for each of the K=4 FIXED causal slots (left, up, up-left, up-right); this "
+    "is an ALIGNMENT sign, not a selection, and exists only so an anti-correlated "
+    "neighbour cannot cancel the shared mode inside the sum (load-bearing on the "
+    "CapgMyo differential array). (2) COMPOSITE -- m[g,t] = (sum_i s_i x[i,t]) >> "
+    "log2(K) with K=4 fixed; off-grid slots contribute 0, so an edge channel simply gets "
+    "a smaller composite and the fitted gain absorbs the scale. (3) ONE FITTED GAIN -- "
+    "beta_g by the family's verbatim rounded integer least squares (_bp_opt_beta, same "
+    "BP_SHIFT scale) of x_g on m over that same previous block, applied to the CURRENT "
+    "block as y = x_g - ((beta_g*m) >> shift); parent rows are left BIT-CLEAN "
+    "(asymmetric rank-1 residual-only injection, INSIGHTS P3). beta_g == 0 degrades the "
+    "stage gracefully to the identity -- a FITTED zero, not a scored option. "
+    "(4) Block 0 is coded as-is; every slot has grid index < g and the previous block is "
+    "bit-identical on both sides, so the decoder recomputes the same signs and the same "
+    "beta -> ZERO side-info, look-ahead 0, dec_ops == enc_ops (INSIGHTS P4). Behind it: "
+    "verbatim order-4 sign-sign LMS (P2) + verbatim adaptive Rice (P5), so the measured "
+    "delta is attributable to the composite regressor alone. NOT A RETIRED MECHANISM: "
+    "not xchan_multiparent (that summed two INDEPENDENTLY FITTED MARGINAL subtracts, "
+    "beta_1+beta_2 ~ 2beta, double-counting the shared mode; here ONE regressor and ONE "
+    "gain fitted AGAINST it = the exact LS solution in the equal-weight direction, whose "
+    "residual is orthogonal to m by construction, so it structurally CANNOT "
+    "over-subtract); not xchan_hint/P11 (no parity split, every channel keeps its full "
+    "dist-1 causal neighbourhood, and the gain is FITTED not unity/convex -- P11's "
+    "stated escape hatch is exactly a fitted-gain multi-neighbour form); not jointbp2 "
+    "(2 free taps + a pair search vs 1 tap + no search, the opposite corner of the "
+    "bias/variance trade); not iklt/P3 (predict-only, one rank-1 removal, no "
+    "energy-preserving rotation, parents untouched); not a P6 lag search (composite "
+    "formed at lag 0 only, which is what P6 settled the physics to be). DECLARED PARTIAL "
+    "REVIVAL: the retired always-on acar+bestpartner also subtracts a mean of many "
+    "channels -- but GLOBALLY and at UNITY gain; this is LOCAL (P1: shared content on "
+    "large arrays is spatially local) and FITTED (so where no shared mode exists beta->0 "
+    "and the stage vanishes rather than injecting the array mean's noise), and unity gain "
+    "is precisely the mis-specification P11 diagnosed. RISKS TO MEASURE: (i) where ONE "
+    "dominant neighbour carries nearly all the MI (P1b: tight arrays are essentially "
+    "rank-1) the average DILUTES that parent -- expect neutral rather than negative, "
+    "since beta re-fits against whatever m is; (ii) on the CapgMyo differential control "
+    "the alignment signs are load-bearing -- mis-estimated signs let the composite "
+    "partially cancel and the codec decays toward having NO spatial stage, which P11 "
+    "showed is worse than best-partner. Report the ISOLATED cross-channel gain against "
+    "the shared LMS+Rice null, as P11 did. Basis: W. A. Fuller, Measurement Error Models "
+    "(Wiley 1987), attenuation / regression dilution (textbook, unverified on this "
+    "corpus); Dolby TrueHD/MLP integer channel matrixing, US 7,392,195 / US 8,239,210, "
+    "the shipping precedent for predicting a channel from a COMBINATION of channels "
+    "(patent-reported, unverified here); D. Rzepka, Biomed. Signal Process. Control "
+    "57:101705 (2020), cross-channel pairing as a second decorrelation stage in a "
+    "low-complexity multichannel biosignal coder (paper-reported, unverified here).")
+_register(Codec("LMS4+Rice+xchan_cmean", xcm_encode, xcm_decode, CodecMeta(
+    integer_only=True,
+    enc_ops=_LMS4_OPS + _XCM_FORM + _XCM_APPLY + _XCM_FIT,
+    dec_ops=_LMS4_OPS + _XCM_FORM + _XCM_APPLY + _XCM_FIT,
+    state_bytes_per_ch=_XCM_STATE, causal=True, lookahead_samples=0,
+    block_size=XCM_BLOCK, notes=_XCM_NOTE), family="cross-channel",
+    desc="order-4 LMS + rank-1 subtract of ONE composite (sign-aligned mean of the "
+         "4 causal grid neighbours) virtual parent with ONE backward-fitted "
+         "integer-LS gain, zero side-info + Rice",
+    retired=True,
+    retired_reason="Conclusively Pareto-dominated by LMS4+Rice+xchan_bestpartner (cost 0.0394 "
+                   "< 0.0466, same LMS4 predictor and same Rice back-end) on real data (cycle "
+                   "2026-08-22, results/cycle_bench.csv): hyser 1.439590x vs 1.480384x "
+                   "(-2.756%), otb 2.055983x vs 2.161938x (-4.901%), capgmyo 1.337657x vs "
+                   "1.350480x (-0.950%), cemhsey 1.804796x vs 1.955547x (-7.709%) -- strictly "
+                   "worse on all 4 real sets at +18% cost, and also dominated by the cheaper "
+                   "joint2 (0.0366), bestpartner_adaptive (0.0387), acar_sel (0.0430) and mst "
+                   "(0.0464). Isolated cross-channel gain vs the shared LMS+Rice null is BELOW "
+                   "the single-selected-parent incumbent on every real set (+8.24% vs +11.31% "
+                   "hyser, +12.63% vs +18.44% otb, +0.41% vs +1.37% capgmyo, +4.36% vs +13.08% "
+                   "cemhsey) while it is the TOP codec on BOTH synthetics (sc0.6 2.662820x, "
+                   "sc0.9 2.646026x, both outright maxima of the run) -- the P11 signature of a "
+                   "basis matched to a stationary equal-gain field. A fixed 1/K pool with ONE "
+                   "shared gain cannot represent the per-pair gain heterogeneity of a real "
+                   "array; the valid multi-parent form remains the JOINT per-parent-gain solve "
+                   "(P1b), not a fixed-weight average (INSIGHTS P13)."))
+
+# NEW candidate (this cycle): CROSS-CHANNEL POOLED (SHRUNK) BIAS STATISTICS -- the
+# bias stage (P9) attacked on a THIRD axis, the ESTIMATOR's sample support, with
+# P9's two already-explored axes (context class, bucket count) held bit-identical
+# to the shipped LMS4bc. Ops/sample-channel on top of the LMS4bc stage (_BC_XTRA,
+# unchanged and reused as-is): 1 add + 1 count increment into the per-slice bucket
+# bins (2), 1 gather of the pooled snapshot (1), and the shrinkage combine --
+# rounded read of the pooled mean (2), 3*mu_c as shift+add (2), add + final shift
+# (2) = 6; plus the amortised end-of-slice recursion, ~5 ops (shift, small
+# multiply by the bucket count, sub, add, store) per TOUCHED BUCKET per slice, i.e.
+# 30*5/128 ~ 1.2 ops/sample-channel at 128 ch -> ~10 ops. No divide; the one small
+# multiply is per bucket per slice, not per sample. Decoder does the identical work
+# (dec_ops == enc_ops minus the encoder-only best-partner scan), and NOTHING extra
+# is transmitted -- the pooled table is rebuilt from reconstructed history (P4).
+# STATE: this is the cheap half of the story. The added table is ARRAY-WIDE, not
+# per-channel: 30 int32 leaky accumulators + 30 int32 slice sums + 30 uint16 slice
+# counts = 300 B TOTAL, i.e. ceil(300/128) = 3 B/ch at 128 channels (~1 B/ch at
+# 320), against the 120 B/CH the per-channel tables already cost.
+_BCPOOL_XTRA = 10       # slice bins + pooled read + shrinkage + amortised recursion
+_BCPOOL_SHARED_B = BC_NCTX * (4 + 4 + 2)          # 300 B for the WHOLE ARRAY
+_BCPOOL_STATE = _BC_STATE + _BP_STATE + -(-_BCPOOL_SHARED_B // cost.N_CH)
+_BCPOOL_NOTE = (
+    "CROSS-CHANNEL POOLED (SHRUNK) BIAS STATISTICS: the shipped LMS4bc corrector "
+    "with its context CLASS, its bucket COUNT (30), its per-channel update LAW and "
+    "its bitstream layout held BYTE-IDENTICAL (_bc_context and the per-channel leaky "
+    "integrator are reused verbatim), changing exactly ONE quantity -- how each "
+    "bucket's mean is ESTIMATED. Alongside the per-channel accumulator S[c,q], keep "
+    "ONE ARRAY-WIDE leaky accumulator Sbar[q] fed by EVERY channel's residual that "
+    "lands in bucket q, and subtract the SHRUNK mean mu = ((2^w - 1)*mu_c + mu_bar) "
+    ">> w with the fixed power-of-two weight w = 2, i.e. (3*mu_c + mu_bar) >> 2, "
+    "where mu_c = (S[c,q] + 16) >> 5 is the incumbent's read and mu_bar = "
+    "(Sbar[q] + 256) >> 9 is the same rounded shift-divide at a wider window. The "
+    "pooled table updates at the END of each time slice from that slice's per-bucket "
+    "sums and counts, Sbar[q] += tot[q] - cnt[q]*(Sbar[q] >> 9), so the estimate used "
+    "at time t depends only on slices < t and the update is channel-ORDER-INDEPENDENT "
+    "-- the vectorized host loop and a sequential on-node loop reach bit-identical "
+    "state, and encoder and decoder run the identical recursion off identical "
+    "reconstructed residuals (ZERO side-info, look-ahead 0, P4). THEORY: P9's "
+    "refinement names the binding constraint as context DILUTION -- each bucket's "
+    "leaky mean is estimated from ~1/NCTX of ONE channel's samples, so ESTIMATION "
+    "VARIANCE (~sigma^2/2^5 here), not available MI, is what caps the stage. Pooling "
+    "multiplies a bucket's sample support by the channel count (128-320), cutting "
+    "that variance term by the same factor, at the cost of a bias equal to the "
+    "channel's deviation from the array-mean bias. Stein's phenomenon states the "
+    "condition exactly: a convex combination of the per-channel and pooled estimates "
+    "has STRICTLY LOWER MSE than the per-channel estimate whenever the "
+    "between-channel spread of the true E[e|ctx] is small relative to per-channel "
+    "estimation variance -- the small-correction, few-samples-per-bucket regime this "
+    "stage demonstrably occupies (shipped corrections are int8-clamped and worth "
+    "tenths of a percent). A lower-MSE estimate of E[e|ctx] subtracts closer to the "
+    "true conditional mean, so the law of total variance bites harder and H(e - mu) "
+    "falls further; second, orthogonal payoff, it RELAXES the dilution constraint "
+    "that bounds how rich a context this pipeline can afford. NOT A RETIRED OR "
+    "DUPLICATE MECHANISM: not a bucket-count sweep and not a new context class (the "
+    "two axes P9's refinement closes/redirects are BOTH held fixed and bit-identical "
+    "to LMS4bc); not a P7 backward argmin (nothing is scored or selected -- w is a "
+    "compile-time constant, so there is no winner's-curse surface); not RETIRED "
+    "LMS4rs (that SPLIT adaptation data across per-regime predictor banks; this "
+    "MERGES estimation data across channels -- the opposite operation -- and applies "
+    "it to a scalar mean, not a 4-tap filter); not RETIRED xctx (the coder is "
+    "untouched, one global adaptive-Rice back-end; what is pooled is a FIRST MOMENT "
+    "upstream of the coder); not the RETIRED always-on global CAR (that averaged the "
+    "SIGNAL across channels and subtracted it at unity gain -- here the signal path, "
+    "the spatial front-end and the predictor are all untouched and what is averaged "
+    "is a per-context STATISTIC of the residual). Divisionless, integer, causal; the "
+    "pooled recursion contracts for any per-bucket occupancy < 2^9 = 512, satisfied "
+    "by construction at C <= 320. Best-partner selection is derived offline over the "
+    "whole signal exactly as in LMS4bc (embeddable realization selects per block, "
+    "look-ahead=block); the bias stage itself is pure streaming. CITATIONS: Efron & "
+    "Morris, 'Stein's estimation rule and its competitors -- an empirical Bayes "
+    "approach', JASA 68(341):117-130, 1973, and the James-Stein result it builds on "
+    "(classical, unverified on this corpus); the corrector machinery itself is this "
+    "registry's own measured construction (P9). RISK TO MEASURE: channel amplitude "
+    "heterogeneity (electrode impedance, distance to the innervation zone -- the "
+    "physical non-uniformity P11 named) biases the pooled mean, and pooling a "
+    "statistic across channels whose true conditional means genuinely differ is the "
+    "regime where Stein shrinkage stops helping; the fixed w=2 weight bounds the "
+    "damage by keeping the per-channel estimate dominant (3/4). A null or small "
+    "negative would be real evidence that the per-context bias is channel-SPECIFIC "
+    "rather than array-wide.")
+_register(Codec("LMS4bcpool+Rice+xchan_bestpartner", bcpool_encode, bcpool_decode,
+    CodecMeta(
+        integer_only=True,
+        enc_ops=_LMS4_OPS + _BC_XTRA + _BCPOOL_XTRA + _XCHAN_OPS + _BP_SELECT_OPS,
+        dec_ops=_LMS4_OPS + _BC_XTRA + _BCPOOL_XTRA + _XCHAN_OPS,
+        state_bytes_per_ch=_BCPOOL_STATE, causal=True, lookahead_samples=0,
+        block_size=ec.BLOCK, notes=_BCPOOL_NOTE), family="temporal",
+    desc="order-4 LMS + LMS4bc's 30-bucket per-context bias corrector with its "
+         "per-context mean SHRUNK toward an array-wide pooled estimate "
+         "(James-Stein/empirical-Bayes, fixed power-of-two weight, one shared "
+         "300 B table, zero side-info) + Rice, under the best-partner front-end"))
 
 
 def list_codecs(include_retired=False):
