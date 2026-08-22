@@ -55,12 +55,24 @@ FIXED_MAGIC = 0x4658  # 'FX'
 FBLOCK = ec.BLOCK      # reuse the Rice block size so order/k blocks align
 
 
+def _shift_pad(xc, j):
+    """xc shifted right by j samples, zero-padded before t=0 (causal). Unlike
+    concatenate((zeros(j), xc[:-j])), this stays correctly shaped when
+    len(xc) < j (found by research/registry.py --audit: the naive form
+    produces an oversized array for a sub-3-sample channel/block, since
+    xc[:-j] does not shrink to a negative-length slice the way a literal
+    j-zero pad assumes)."""
+    n = xc.size
+    k = min(j, n)
+    return np.concatenate((np.zeros(k, xc.dtype), xc[:n - k]))
+
+
 def _fixed_residuals(xc):
     """All four fixed-predictor residual streams for a 1-D channel (int64)."""
     xc = xc.astype(np.int64)
-    x1 = np.concatenate(([0], xc[:-1]))
-    x2 = np.concatenate(([0, 0], xc[:-2]))
-    x3 = np.concatenate(([0, 0, 0], xc[:-3]))
+    x1 = _shift_pad(xc, 1)
+    x2 = _shift_pad(xc, 2)
+    x3 = _shift_pad(xc, 3)
     r = np.empty((4, xc.size), np.int64)
     r[0] = xc
     r[1] = xc - x1
@@ -7101,34 +7113,116 @@ def list_retired():
 
 
 # ===========================================================================
-def _selftest():
+def _main_fixture():
+    """The original --selftest fixture: correlated noise + a shared common-mode
+    + a spike burst on an 8x16 grid, so cross-channel codecs get exercised."""
     rng = np.random.default_rng(0)
-    # A realistic-ish int16 field: correlated noise floor + spikes + a shared
-    # common-mode, on an 8x16 grid, so cross-channel codecs are exercised too.
     C, N, cols = 32, 2500, 8
     base = rng.normal(0, 12, (C, N))
-    common = rng.normal(0, 6, N)                       # shared common-mode
+    common = rng.normal(0, 6, N)
     x = (base + 0.5 * common).round().astype(np.int16)
-    x[5, 800:820] += 500                               # a spike burst
+    x[5, 800:820] += 500
     x[6, 800:820] += 300
+    return "gaussian_common_mode", x, cols
 
-    # Bit-exactness is checked for EVERY codec ever registered, retired or not
-    # -- retirement means "excluded from the default bench/leaderboard sweep",
-    # never "excused from correctness." Nothing is deleted or untested.
-    all_codecs = list_codecs(include_retired=True)
-    n_retired = len(list_retired())
-    print(f"registry self-test on random int16 [{C} x {N}], {len(all_codecs)} codecs"
-          f" ({n_retired} retired, excluded from the default sweep)\n")
-    print(f"{'codec':<20}{'ratio':>7}{'round-trip':>12}{'emb_ok':>8}"
-          f"{'neural':>8}{'cost':>8}  status")
-    print("-" * 71)
-    all_ok = True
-    for c in all_codecs:
+
+def _synthetic_edge_fixtures():
+    """Deliberately awkward synthetic shapes that a real single fixture can miss:
+    all-zero, int16 extremes, one channel, one sample, a grid where the channel
+    count is NOT a multiple of cols (off-grid neighbours), and near-perfect
+    correlation (stresses the cross-channel subtract's numeric range). None of
+    these are for measuring ratio -- they exist to catch off-by-one/overflow/
+    shape bugs a single lucky fixture would never trigger."""
+    rng = np.random.default_rng(7)
+    fixtures = []
+
+    fixtures.append(("all_zero", np.zeros((16, 800), np.int16), 4))
+
+    extremes = np.zeros((8, 400), np.int16)
+    extremes[:, ::2] = 32767
+    extremes[:, 1::2] = -32768
+    fixtures.append(("extremes", extremes, 4))
+
+    fixtures.append(("single_channel", rng.normal(0, 20, (1, 1000))
+                      .round().astype(np.int16), 1))
+
+    fixtures.append(("single_sample", rng.normal(0, 20, (32, 1))
+                      .round().astype(np.int16), 8))
+
+    ragged = rng.normal(0, 15, (7, 301)).round().astype(np.int16)
+    fixtures.append(("ragged_grid_c7_cols3", ragged, 3))
+
+    base = rng.normal(0, 10, 2000)
+    highcorr = np.tile(base, (32, 1)) + rng.normal(0, 0.5, (32, 2000))
+    fixtures.append(("high_corr", highcorr.round().astype(np.int16), 8))
+
+    fixtures.append(("cols_eq_1", rng.normal(0, 15, (24, 600))
+                      .round().astype(np.int16), 1))
+
+    return fixtures
+
+
+def _real_data_fixtures(max_samples=1500):
+    """Small slices of the ACTUAL committed real corpus (Hyser/OTB/CapgMyo/
+    CEMHSEY), offline via sim_data/corpus_npz -- no network. This is the
+    concrete answer to 'checked against test cases other than the codec's own
+    synthetic fixture': every registered codec must round-trip bit-exactly on
+    every real dataset the leaderboard reports numbers for, not just on
+    friendly synthetic noise. Kept short (max_samples) so --audit stays fast;
+    this is a correctness gate, not a ratio measurement (bench.py is that)."""
+    import datasets  # local import: --selftest callers don't need datasets.py
+    fixtures = []
+    for ds in datasets.corpus():
+        if ds.kind == "synthetic":
+            continue
+        try:
+            x, grid = ds.load(max_samples=max_samples)
+        except Exception as e:
+            print(f"  WARNING: could not load real fixture {ds.name} ({e}) -- "
+                  f"audit coverage is REDUCED, this is not a pass")
+            continue
+        fixtures.append((f"real:{ds.name}", x.astype(np.int16), grid[1]))
+    return fixtures
+
+
+def _run_fixture(codecs, name, x, cols, check_determinism=False):
+    """Round-trip every codec on one fixture; returns list of (codec, ok, ratio)."""
+    rows = []
+    for c in codecs:
         blob = c.encode(x, cols=cols)
         y = c.decode(blob)
         ok = np.array_equal(x, y)
+        if ok and check_determinism:
+            blob2 = c.encode(x, cols=cols)
+            if blob2 != blob:
+                ok = False
+                print(f"  NON-DETERMINISTIC encode for {c.name} on fixture "
+                      f"{name!r}: two encode() calls on the SAME input produced "
+                      f"different bytes ({len(blob)} vs {len(blob2)} B)")
+        ratio = x.nbytes / len(blob) if len(blob) else float("inf")
+        rows.append((c, ok, ratio))
+    return rows
+
+
+def _selftest():
+    """Fast correctness gate: one synthetic fixture, every registered codec,
+    bit-exact round-trip. This is what the PostToolUse hook runs on every
+    codec/registry edit, so it stays deliberately cheap (seconds, not minutes).
+    Run --audit for the thorough, multi-fixture + real-data + known-answer gate
+    (intended for end-of-cycle verification, not every keystroke)."""
+    name, x, cols = _main_fixture()
+    all_codecs = list_codecs(include_retired=True)
+    n_retired = len(list_retired())
+    print(f"registry self-test on random int16 [{x.shape[0]} x {x.shape[1]}], "
+          f"{len(all_codecs)} codecs ({n_retired} retired, excluded from the "
+          f"default sweep)\n")
+    print(f"{'codec':<20}{'ratio':>7}{'round-trip':>12}{'emb_ok':>8}"
+          f"{'neural':>8}{'cost':>8}  status")
+    print("-" * 71)
+    rows = _run_fixture(all_codecs, name, x, cols)
+    all_ok = True
+    for c, ok, ratio in rows:
         all_ok &= ok
-        ratio = x.nbytes / len(blob)
         status = "RETIRED" if c.retired else ""
         print(f"{c.name:<20}{ratio:>6.2f}x{('OK' if ok else 'FAIL!'):>12}"
               f"{('OK' if c.cost.embedded_ok else 'no'):>8}"
@@ -7138,9 +7232,115 @@ def _selftest():
     print("\nregistry self-test: ALL round-trips bit-exact")
 
 
+def _audit():
+    """Thorough correctness gate (non-negotiable #4: no hallucinated benchmark
+    numbers). On top of everything --selftest does, this additionally:
+      1. runs the shared Rice-coder known-answer tests (embedded_codec.py),
+         which cross-check the production encoder against an INDEPENDENTLY
+         written decoder -- catches a bug a paired encode/decode round-trip
+         cannot, because a paired pair can share the same bug and still agree
+         with itself;
+      2. round-trips every ACTIVE codec against several deliberately awkward
+         synthetic edge cases (all-zero, int16 extremes, N=1, ragged grids,
+         near-perfect correlation) that one lucky fixture can miss;
+      3. round-trips every ACTIVE codec against REAL slices of all four
+         committed datasets (Hyser/OTB/CapgMyo/CEMHSEY) -- the same data the
+         leaderboard reports ratios on, not just synthetic noise;
+      4. re-encodes the main fixture twice per codec and asserts byte-identical
+         output (catches hidden non-determinism, which would make a reported
+         ratio non-reproducible);
+      5. checks two degenerate-case ratio bounds as an automated version of
+         INSIGHTS.md's sanity anchor: an all-zero fixture must compress hugely
+         (ratio >= 5x -- if it doesn't, a codec silently isn't exploiting
+         constant data), and a full-range white-noise fixture must NOT ("any
+         lossless ratio > ~6x on realistic broadband is a leak") compress much
+         at all (ratio < 1.5x -- if it does, something is leaking information
+         the round-trip check alone would not catch, e.g. via a look-ahead bug
+         that still happens to round-trip).
+    Intended for end-of-cycle / pre-promotion verification (the `verifier`
+    agent should run this instead of hand-rolling ad hoc probes each cycle),
+    not for the PostToolUse hook's fast per-edit loop."""
+    print("=== 1/5: known-answer tests (embedded_codec.py) ===")
+    ec._known_answer_tests()
+    print()
+
+    active = list_codecs(include_retired=False)
+    print(f"=== 2/5: synthetic edge-case fixtures ({len(active)} active codecs) ===")
+    all_ok = True
+    for name, x, cols in _synthetic_edge_fixtures():
+        rows = _run_fixture(active, name, x, cols)
+        n_fail = sum(1 for _, ok, _ in rows if not ok)
+        all_ok &= (n_fail == 0)
+        print(f"  {name:<24} shape={x.shape}  cols={cols}  "
+              f"{'ALL OK' if n_fail == 0 else f'{n_fail} FAILED'}")
+        for c, ok, _ in rows:
+            if not ok:
+                print(f"    FAIL: {c.name} on fixture {name!r}")
+    print()
+
+    print(f"=== 3/5: real-data fixtures ({len(active)} active codecs) ===")
+    real_fixtures = _real_data_fixtures()
+    if not real_fixtures:
+        print("  WARNING: no real fixtures loaded -- real-data coverage is ZERO "
+              "this run (network/cache issue?); this is a reduced audit, not a "
+              "clean pass")
+    for name, x, cols in real_fixtures:
+        rows = _run_fixture(active, name, x, cols)
+        n_fail = sum(1 for _, ok, _ in rows if not ok)
+        all_ok &= (n_fail == 0)
+        print(f"  {name:<24} shape={x.shape}  cols={cols}  "
+              f"{'ALL OK' if n_fail == 0 else f'{n_fail} FAILED'}")
+        for c, ok, _ in rows:
+            if not ok:
+                print(f"    FAIL: {c.name} on fixture {name!r}")
+    print()
+
+    print(f"=== 4/5: determinism ({len(active)} active codecs) ===")
+    name, x, cols = _main_fixture()
+    rows = _run_fixture(active, name, x, cols, check_determinism=True)
+    n_fail = sum(1 for _, ok, _ in rows if not ok)
+    all_ok &= (n_fail == 0)
+    print(f"  {'ALL DETERMINISTIC' if n_fail == 0 else f'{n_fail} NON-DETERMINISTIC'}")
+    print()
+
+    print("=== 5/5: degenerate ratio-sanity bounds ===")
+    zero_x = np.zeros((16, 4000), np.int16)
+    zero_rows = _run_fixture(active, "all_zero_sanity", zero_x, 4)
+    for c, ok, ratio in zero_rows:
+        if ratio < 5.0:
+            all_ok = False
+            print(f"  FAIL: {c.name} only reaches {ratio:.2f}x on all-zero input "
+                  f"(expected >= 5x) -- likely not exploiting constant data")
+
+    rng = np.random.default_rng(99)
+    noise_x = rng.integers(-32768, 32768, (16, 4000), dtype=np.int64).astype(np.int16)
+    noise_rows = _run_fixture(active, "white_noise_sanity", noise_x, 4)
+    for c, ok, ratio in noise_rows:
+        if ratio > 1.5:
+            all_ok = False
+            print(f"  FAIL: {c.name} reaches {ratio:.2f}x on full-range white "
+                  f"noise (expected < 1.5x, INSIGHTS.md's leak-sanity anchor) "
+                  f"-- possible information leak")
+    print(f"  all-zero floor: {'OK' if all(r >= 5.0 for _, _, r in zero_rows) else 'FAIL'}"
+          f" (worst {min(r for _, _, r in zero_rows):.2f}x)")
+    print(f"  white-noise ceiling: "
+          f"{'OK' if all(r <= 1.5 for _, _, r in noise_rows) else 'FAIL'}"
+          f" (worst {max(r for _, _, r in noise_rows):.2f}x)")
+
+    assert all_ok, "registry audit FAILED -- see FAIL lines above"
+    print("\nregistry audit: ALL checks passed (known-answer, synthetic edge "
+          "cases, real data, determinism, degenerate sanity bounds)")
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--audit", action="store_true",
+                     help="thorough gate: known-answer tests + edge-case + "
+                          "real-data fixtures + determinism + sanity bounds")
     args = ap.parse_args()
-    # default action is the self-test (the verifier hook invokes with --selftest)
-    _selftest()
+    if args.audit:
+        _audit()
+    else:
+        # default action is the fast self-test (the verifier hook invokes this)
+        _selftest()

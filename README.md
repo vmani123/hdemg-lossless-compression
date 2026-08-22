@@ -43,7 +43,9 @@ picture in [`research/LEADERBOARD.md`](research/LEADERBOARD.md).
 ./research/bootstrap.sh                 # venv + numpy/scipy/zstandard/mtscomp; cached real corpus
 export PYTHONPATH=host_tools:research
 
-python3 research/registry.py --selftest # every codec round-trips bit-exact on random int16
+python3 research/registry.py --selftest # every codec round-trips bit-exact on random int16 (fast)
+python3 research/registry.py --audit    # thorough gate: known-answer tests, edge cases, real
+                                         # data, determinism, sanity bounds -- run before promoting
 python3 research/embedded_verify.py      # audit the embedded_ok gate (add --strict for CI)
 python3 research/bench.py                # reference bar + candidates, real + synthetic -> CSV
 python3 research/search.py --datasets hyser_1dof_f1_s1 --max-samples 15000   # hill-climb on real data
@@ -57,8 +59,12 @@ fresh session; an uncached set downloads on demand via `research/datasets.py`.
 
 ```
 host_tools/     embedded_codec.py (delta/LMS/+xchan primitives, adaptive Rice),
-                bench_lossless.py (FLAC/WavPack/mtscomp/zstd/LZMA/gzip reference bar),
-                verify_compressed.py, gen_neural_mem.py, load_wfdb.py
+                gen_neural_mem.py, load_wfdb.py -- ACTIVELY USED.
+                bench_lossless.py, verify_compressed.py -- legacy from the original
+                RHD2164-FPGA-Emulator repo (both need sim_data/ground_truth.npy,
+                which does not exist here); research/bench.py and
+                research/registry.py --audit are this repo's real reference-bar
+                and correctness tools
 research/       registry.py (all codecs behind one interface + declared cost metadata),
                 embedded_cost.py (the embedded_ok gate + Pareto cost),
                 embedded_verify.py (independent audit of that gate),

@@ -34,12 +34,17 @@ exists (the uniform `encode`/`decode` + metadata interface), and
    `int16 [channels, samples]`. Integer / fixed-point only — **no float in the
    codec path** (FPGA-disqualified). Causal, bounded block size — no
    whole-recording look-ahead.
-2. **Ship a self-test.** Extend `embedded_codec.py`'s `_selftest()` (or
-   `registry.py --selftest`) so your new codec round-trips on random int16 **and**
-   on a spiky case. Run it: `PYTHONPATH=host_tools ./.venv/bin/python
-   host_tools/embedded_codec.py`. It must print OK. A PostToolUse hook re-runs this
-   on every edit and **blocks** you if the round-trip breaks — fix it, don't work
-   around it.
+2. **Ship a self-test.** Your codec is automatically exercised by `registry.py
+   --selftest` (fast; the PostToolUse hook re-runs this on every edit and
+   **blocks** you if the round-trip breaks — fix it, don't work around it) and
+   by `registry.py --audit` (thorough: known-answer Rice-coder cross-check,
+   several awkward synthetic edge cases, real slices of all four committed
+   datasets, determinism, degenerate sanity bounds — ~2-3 min, not run on
+   every edit). Run `--audit` once before you finish: `PYTHONPATH=host_tools
+   ./.venv/bin/python research/registry.py --audit`. It has caught real bugs
+   before (e.g. a fixed-predictor codec that crashed on a sub-3-sample block)
+   that a single friendly fixture never would — better you catch it than the
+   verifier.
 3. **Exactly one codec.** Don't refactor unrelated code, don't touch the emulator
    RTL (`rtl/`, `sim/`), don't edit the benchmark's reference-bar codecs.
 4. **Encoder and decoder must be a matched pair** — any adaptation (LMS weights,
