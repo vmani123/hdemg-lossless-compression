@@ -8,10 +8,128 @@ Watch-list methods are never promoted without explicit human approval.
 
 **What's already been tried lives elsewhere** — read those first so you don't
 re-propose a spent lever:
-- `research/INSIGHTS.md` — the durable principles (P1–P5), the current open
+- `research/INSIGHTS.md` — the durable principles (P1–P12), the current open
   frontier, and the dead-ends list.
 - `research/CYCLE_LOG.md` — the append-only per-cycle ledger (one row per cycle).
 - `research/LEADERBOARD.md` — the current best + Pareto front.
+
+**MEASUREMENT OUTCOME + NEXT HYPOTHESES — 2026-08-22 (appended by the analyst
+after the cycle measured; the proposal note for this cycle follows below).**
+All three proposed candidates were implemented, benched on all four real sets
+(`results/cycle_bench.csv`), and returned **unanimous PROMOTE / PROMOTE** with
+**no verifier splits**. **None was promoted** — the headline stays
+`LMS4bc+Rice+xchan_bestpartner`. Scorecard: **#3 `bcpool` is the cycle's win**
+(hyser 1.485974×, otb **2.194780× — the highest real ratio ever recorded in this
+repo**, capgmyo 1.350623×, cemhsey 1.955683×; beats the headline on 3/4 but
+loses CapgMyo −0.186% against wins of only +0.060/+0.061/+0.022%, 4-set mean a
+dead tie at +6.7% cost) — **kept, non-dominated**. **#1 `bcxm` answered its
+question NEGATIVE** (loses all 4 real sets; the magnitude and spatial-sign
+context classes are substitutes, not additive) — kept only because `LMS4bc` is
+dearer than it, and **flagged for retirement review**. **#2 `xchan_cmean` was
+RETIRED** (loses all 4 real sets by −0.95…−7.71%, dominated by five cheaper
+codecs) while topping **both** synthetics — the second confirmed instance of
+P11's basis-mismatch warning sign. Durable learnings: `INSIGHTS.md` **P9
+refinement (a)** (context-class composition is a dead end; a spatial slot only
+carries MI in the *same-slice residual* domain), **P9 refinement (b)** (a new
+live third axis: the bias corrector's *estimator sample support*), and the new
+**P13** (fixed-weight composite spatial parent). Records:
+`experiments/033`–`035`; ledger rows `CYCLE_LOG.md` 34–36.
+
+**Next hypotheses, ranked by expected payoff (consistent with the refreshed
+`INSIGHTS.md` frontier):**
+
+1. **`bcpool_gate` — decoder-observable adaptive shrinkage weight** (INSIGHTS
+   frontier #1; P9 refinement (b) + P4 + P7). Keep `bcpool` byte-identical and
+   replace its *fixed* 1/4 shrinkage with a two-level power-of-two weight chosen
+   by a fixed rule on state both sides already hold — e.g. shrink by 1/4 when
+   `sgn(mu_bar[q]) == sgn(mu_c[c,q])` and by 0 otherwise, or key it on
+   `|Sbar[q]|` against a fixed threshold. Costs one compare and one shift, zero
+   side-info, look-ahead 0, no new state class, and it is a **fixed rule, not a
+   per-block argmin** (P7). *Expected payoff: highest of the three.* Both
+   branches are already measured on all four real sets, so the target is
+   concrete — keep `bcpool`'s +0.060/+0.062/+0.022 pp on the monopolar arrays
+   while zeroing its −0.187 pp on CapgMyo, which would be **the first codec to
+   beat `LMS4bc` on all four real sets** and take the headline. *Risk:* the
+   agreement statistic may be too noisy per bucket at 30 buckets × ~32-hit
+   windows; mitigate by keying the gate on the *array-wide* accumulator only
+   (one decision per bucket per slice, not per channel).
+2. **`bcxs_sel` — MI-gated bias-context class** (INSIGHTS frontier #2, carried
+   over from this cycle's row #4, now with a domain constraint). Select `bcxs`'s
+   **same-slice residual** spatial-gradient context where a backward
+   neighbour-correlation statistic (or the `acar_sel` channel-count/geometry
+   proxy) says neighbour MI exists, and `bc_lite`'s temporal context where it
+   does not. *Expected payoff: medium.* Ceiling stated honestly: a two-way gate
+   reaches at most the max of its own two branches per set (P7), and neither
+   branch holds the OTB corner — so expect a strong **mean-real/cost** Pareto
+   point (`bcxs`'s 1.74788 at 0.1013 with CapgMyo repaired), not the headline.
+   **`bcxm` closed the alternative route to the same goal** (composing the two
+   context classes in one word), so the gate is now the only live form.
+3. **`jointbp2_sel` — scale-gate the JOINT 2-parent front-end** (P1b + P1 + P8,
+   re-pointed). P1b says a jointly-solved best-*pair* wins on large diffuse
+   arrays (`jointbp2` holds the outright embeddable Hyser max 1.496924×) while a
+   single selected parent wins tight ones (OTB 2.161938× vs `jointbp2`'s
+   2.152244×). Gate the two on **decoder-observable channel count / grid
+   geometry**, exactly as `acar_sel` already does. *Expected payoff: medium-low
+   but on the dominant lever* (P1: the spatial front-end is worth ~19× every
+   temporal knob), and it is the only frontier item that touches it. *Risk:* P7
+   — three prior gating attempts landed at or below the max of their own
+   branches; this one is cheap because both branches are already registered and
+   the gate variable is a header field, not an estimate. **Do not** re-attempt
+   any fixed-weight or averaged multi-parent form (P13, retired this cycle).
+
+**Survey-cycle note — 2026-08-22 (current).** Slate refreshed against
+`INSIGHTS.md` (P1–P12 + the re-ranked open frontier), `CYCLE_LOG.md` rows 1–33,
+`LEADERBOARD.md` (2026-08-19 snapshot) and `registry.py`'s **30 codecs, 13
+retired** (verified by running `registry.py --selftest`, which tags each retired
+entry). Incumbent headline is `LMS4bc+Rice+xchan_bestpartner` (cost 0.120,
+30 scale-free quantized-**magnitude** buckets); its challenger is
+`LMS4bcxs+Rice+xchan_bestpartner` (cost 0.101, 27 spatial-**sign** buckets, best
+4-set real mean, CEMHSEY max), which fails to take the headline only on OTB.
+Three new candidates are proposed at **#1–#3** below, each on a **different
+stage of the pipeline and a different information lever**:
+
+- **#1 `bcxm`** — *bias stage, context **composition***: swap one own-channel
+  slot of the headline's 30-bucket context word for the spatial-gradient slot
+  that `bcxs` proved carries cross-channel MI. Same bucket budget, same
+  machinery, one variable changed.
+- **#2 `xchan_cmean`** — *spatial front-end, **estimator SNR***: replace the
+  single **selected** parent with a **composite (averaged) causal-neighbour
+  parent** carrying one **fitted** integer gain. Attacks regressor measurement
+  noise (errors-in-variables attenuation) instead of widening a hypothesis
+  class — it *removes* the per-block parent search rather than enlarging it.
+- **#3 `bcpool`** — *bias stage, **estimator sample support***: leave the
+  context class and bucket count alone and shrink each per-channel bucket mean
+  toward an **array-pooled** bucket mean with a fixed power-of-two weight
+  (James–Stein / empirical-Bayes). The first mechanism here that attacks P9's
+  *dilution* constraint rather than trading against it; its pure-pooled corner
+  also collapses the bias family's dominant state cost (per-channel tables →
+  one array-wide table).
+
+**Retired-ledger check.** All 13 retired codecs were enumerated and none is
+re-proposed: `LMS+Rice+xchan_adaptive`, `LMS+Rice+xchan_bestpartner` (order-8),
+`iklt`, `iklt_adaptive`, `xchan_tans`, `LMS4rs`, `acar+bestpartner`,
+`xchan_multiparent`, `xctx`, `LMS4v2`, `xchan_xres`, `xchan_hint`, `LMS4vs`.
+Each new row names its nearest retired relative and the axis on which it is a
+different bet. **One partial revival is flagged explicitly:** #2 revives the
+*mean-of-many-channels-as-parent* idea from the retired always-on
+`LMS4+Rice+acar+bestpartner` — but at **local** scale instead of global and with
+a **fitted** integer gain instead of `acar`'s unity-gain subtraction, which is
+precisely the mis-specified-gain failure P11 diagnosed in `xchan_hint`. See the
+boundary clarification below the table.
+
+**Correction to the frontier's expected payoff (`bcxs_sel`, INSIGHTS frontier
+#1).** The frontier states that gating `bcxs`'s spatial context against
+`bc_lite`'s temporal context on a neighbour-MI proxy "would beat `LMS4bc` on all
+four real sets". That ceiling does not follow from the recorded per-dataset
+table: a two-way gate can at best reach the **max of its own two branches** on
+each set (P7), and **neither** branch holds the OTB corner — that belongs to the
+headline's 30-bucket quantized-**magnitude** context, a third context class the
+gate never selects. So the gate is expected to yield a strong Pareto point
+(mean-real and cost) but **not** the headline. The productive move is therefore
+to first *compose* the two winning slots into one context word at the same
+budget (#1) and only then gate — which is why #1 outranks the gate this cycle.
+`bcxs_sel` stays on the table as carry-over row **#4**, unchanged in mechanism,
+re-ranked with this ceiling stated.
 
 **Survey-cycle note — 2026-08-19.** Slate refreshed against `INSIGHTS.md`
 (P1–P10 + open frontier), `CYCLE_LOG.md` rows 1–30, and `registry.py`'s 27
@@ -44,8 +162,10 @@ cross-channel-context effect (+0.090/+0.067/+0.082 pp on hyser/otb/cemhsey,
 **−0.045 pp on the CapgMyo low-MI negative control**) shows the value of a
 spatial context is bounded by the same neighbour MI that bounds P1.
 
-**→ Next hypotheses, ranked by expected payoff** (consistent with the refreshed
-`INSIGHTS.md` frontier; proposals only, no codec edits here):
+**→ Next hypotheses, ranked by expected payoff** (written 2026-08-19;
+**superseded by the 2026-08-22 slate above** — item 1 is re-ranked to table row
+#4 with a corrected ceiling, item 2 is promoted and made concrete as table row
+#1 `bcxm`, item 3 is unchanged as table row #5. Kept for the record):
 
 1. **`bcxs_sel` — MI-gate the bias corrector's context class** (P9 refined + P1 +
    P4). Select `bcxs`'s cross-channel-gradient context where neighbour
@@ -96,36 +216,52 @@ literature grounding.
 **Update 2026-08-17:** old candidates #4 and #5 below were tried (five parallel
 cycles, 2026-08-05→2026-08-16, consolidated into one PR — see `CYCLE_LOG.md`
 rows 16–30). The temporal functional-form change **succeeded** — a JPEG-LS/CALIC
-per-context bias corrector is now the leaderboard best (INSIGHTS P9) — so #7
+per-context bias corrector is now the leaderboard best (INSIGHTS P9) — so the JPEG-LS/LOCO row (that cycle's #7, now row **#8**)
 below is **partially spent**: the bias-correction half of the JPEG-LS mechanism
 is done, the full MED/LOCO 2D-predictor replacement remains open. The
-scale-selected spatial front-end (#4) was attempted 3 independent ways and found
+scale-selected spatial front-end (that cycle's #4, now row **#5**) was attempted 3 independent ways and found
 ratio-neutral-at-best every time (INSIGHTS P7) — kept on the list but re-ranked
 down; do not attempt a 4th *learned/estimated* gate criterion without reading P7
 first, a *decoder-observable* gate (channel count, à la `acar_sel`) remains the
 one form proven to work.
 
-**Update 2026-08-19 (survey cycle, this refresh):** three **new, mechanistically
-distinct** proposals added at #1–#3 and ranked above the carry-overs. Each was
-checked against `registry.py`'s 11 retired codecs and INSIGHTS' dead-end list;
-the nearest retired relative is named per row with the reason this version is
-not the same bet. Chosen axes: **(1) scan-order / channel-pairing topology**
-(untouched — every prior spatial attempt varied *which* parent or *how many*,
-never *how many already-coded sides* a channel has), **(2) the class of
-conditioning variables in the proven bias corrector** (frontier #1, but at the
-variable level, not the bucket-count level), **(3) the adaptation law of the
-sign-sign LMS** (untouched — prior temporal attempts varied order, coefficient-set
-count, and polynomial degree, never the step-size rule).
+**Update 2026-08-19 (survey cycle):** three new proposals were added at #1–#3 —
+`xhint` (sidedness of the spatial parent set), `bcxs` (class of the bias
+corrector's conditioning variables), `LMS4vs` (adaptation law of the sign-sign
+LMS). **All three are now spent and their rows have been retired from this
+table:** `xhint` and `LMS4vs` are Pareto-dominated and retired in the registry
+(INSIGHTS **P11**, **P12**); `bcxs` measured positive, is registered and
+non-dominated, and is now an *incumbent* the new slate builds on rather than a
+proposal. The durable learnings live in `INSIGHTS.md`; the outcome summary is in
+the cycle-result note above.
+
+**Update 2026-08-22 (survey cycle, this refresh):** three **new, mechanistically
+distinct** proposals added at #1–#3 and ranked above the carry-overs, one per
+stage/lever: **(1) context *composition* inside the proven bias corrector**
+(mix the two winning slot classes at a fixed bucket budget — the axis INSIGHTS
+P9's refinement names productive, applied to the *headline's* machinery rather
+than `bc_lite`'s), **(2) the *estimator* of the rank-1 spatial projection**
+(a composite, noise-averaged parent with one fitted gain — attacks
+errors-in-variables attenuation of β, and *removes* a per-block search instead
+of widening one, per P7), **(3) the *sample support* of the bias corrector's
+per-context statistics** (cross-channel pooling / shrinkage — attacks the
+context-dilution constraint itself, and collapses the bias family's state).
+Each was checked against `registry.py`'s **13** retired codecs and INSIGHTS'
+dead-end list; the nearest retired relative is named per row with the reason
+this version is not the same bet. **Row numbering shifted this refresh:** the
+2026-08-19 rows #1–#3 are spent and removed, the frontier gate enters at #4, and
+every earlier carry-over moved down one (old #4→#5, #5→#6, #6→#7, #7→#8).
 
 | # | method | why it may beat the current best | verdict | key caveat |
 |---|---|---|---|---|
-| 1 | **`xhint` — encoding-interleaved two-sided spatial prediction** (quincunx / HINT topology). Split the grid into a geometry-fixed checkerboard; code the "black" half with the incumbent best-partner rank-1 subtract, then predict each "white" channel from a **convex** (sum-to-one, shift-only) average of its already-reconstructed orthogonal black neighbours; unchanged LMS4 + Rice downstream | **Spatial lever (P1, the dominant one), new mechanism: sidedness, not parent count.** For a smooth spatial field, two-sided *interpolation* has strictly lower error variance than one-sided *extrapolation* — for an AR-like array covariance, σ²(1−2ρ₁²/(1+ρ₂)) < σ²(1−ρ₁²) whenever ρ₁>0, so the saved rate is ½log₂ of that variance ratio on half the channels. Second, averaging K **in-phase** neighbours (P6 settled that neighbour MI is zero-lag volume conduction, so they *are* in phase) attenuates each neighbour's independent noise ~1/K while preserving the shared mode — it raises the SNR of the common-mode estimate, i.e. it attacks P7's binding estimation-variance constraint instead of fighting it. No per-block search is added at all (topology is fixed by geometry), so the winner's curse cannot apply. Literature: HINT / interleaved-HINT and quincunx-lifting optimal predictors (Roos & Viergever; Aiazzi–Alparone–Baronti, IEEE TIP 10(1) 2001) report real gains over raster-causal predictors *(paper-reported, unverified here)* | **embeddable** — masks fixed by geometry (zero side-info), one add + one shift per white channel, +1 slice of reconstructed-neighbour buffer (~256 B at 128 ch), no multiply/divide, two ordered sub-passes **inside one time slice** so look-ahead stays 0. Est. cost ≈ 0.045–0.055 (near `mst`); fits both the 2 kS/s and the 125-cyc neural budget | **Not retired `xchan_multiparent`** (cycle 8, retired): that summed two *independently fitted marginal* rank-1 subtracts (β₁+β₂ ≈ 2β ⇒ over-subtracts the shared mode). Convex sum-to-one weights **structurally cannot** over-subtract. **Not retired `iklt`/`iklt_adaptive`** (P3): predict-only lifting, **no update step** — the black channels stay bit-clean, so noise is injected only into the residual, which is exactly P3's stated robustness condition for the rank-1 subtract. **Honest risk:** the black half loses its distance-1 orthogonal parent and falls back to the diagonal (√2) — net gain = white-set improvement − black-set degradation. P1b's note that the dominant partner on tight arrays is *already* a diagonal neighbour is the reason to expect the degradation to be small, but it is a real cost. Expect ~zero on CapgMyo (ρ≈0.29), per P1 |
-| 2 | **`bcxs` — cross-channel-gradient context for the bias corrector.** Keep `LMS4bc`'s divisionless (B,N,C) machinery verbatim; **change the conditioning variable class** from own-channel temporal residual history to co-located *spatial* residual gradients: q3(e[left,t]−e[up,t]) × q3(e[parent,t]) × q3(e[t−1]), ~27 buckets | **Combines the two most recently proven facts.** Wu & Memon (*Context-based lossless interband compression — extending CALIC*) show that context modeling of the **prediction-error field** captures higher-order interband correlation that a *simple linear interband predictor* cannot. Our best-partner subtract **is** exactly such a predictor: it removes only the rank-1, scalar-gain, linear projection onto one neighbour. What survives is (a) dependence on neighbours the projection never used — and P1b proved a second parent carries real MI on large arrays — and (b) the amplitude-dependent/nonlinear part. P9 proved the *conditional-mean* correction is a live, non-P5 lever. So: harvest the second parent's MI as a **model-free conditional mean in a table**, not as a second linear subtract (retired) nor a joint 2×2 solve (P1b: pays only on large arrays). A table-based mean cannot over-subtract and degrades gracefully to 0 where the MI is absent | **embeddable** — state identical to `LMS4bc_lite` (27 buckets × (int32,int16,int8)/ch ≈ 190 B/ch, ~24 KB at 128 ch), 3 compares + 2 subtracts to form the context, no multiply/divide. `_bias_forward` already walks channels in index order with a same-slice parent (< g), so the extra neighbour needs no new ordering machinery. Est. cost ≈ 0.10–0.12 | **Not retired `xctx`** (cycle 9, P5): xctx conditioned the **Rice parameter k** — a second-moment/back-end lever. This conditions a **first moment of the residual stream, upstream of an untouched coder** (the same disclosure both shipped `bc` codecs make). **Not a parameter variant of the shipped `bc`s**: those index own-channel *temporal* history (27-ctx signs, 30-ctx quantized magnitudes) plus one parent bit; this changes the *variables*, not the bucket count. **Closest negative evidence:** P5 measured H(e_c \| cross-channel ctx) ≈ H(e_c). A clean null here would sharpen P5 into "the cross-channel conditional law is exhausted in **both** moments after the rank-1 subtract" — a real result either way |
-| 3 | **`LMS4vs` — per-tap sign-agreement variable-step sign-sign LMS.** Order stays 4, one coefficient set, ±1 update *direction* unchanged; the step becomes a per-tap power of two adjusted by a saturating counter on agreement of consecutive gradient signs (agree ⇒ larger step, alternate ⇒ smaller). Update = `w_i += sign(e)·sign(h_i) << (SMAX − s_i)` — shifts only | **Attacks the second moment of the defect P9 proved exists.** Sign-sign LMS's steady-state excess MSE (misadjustment) scales with the *fixed* step: with a constant ±1 increment the filter permanently dithers about its fixed point, and that dither is an additive predictor-independent noise floor on **every** residual, inflating the Rice length by ≈½log₂(1+μ_excess/σ²_min) bits/sample. P9 harvested this defect's *first moment* (the context-conditional DC) and it became the leaderboard best — its *variance* term is untouched and the bias corrector structurally cannot reach it. Alternating gradient signs are a directly backward-observable "at the fixed point, dithering" indicator; agreement signals a burst onset needing tracking. Classical variable-step sign algorithm (Harris–Chabries–Bishop VS-LMS, IEEE TASSP 1986; VSS-LMS review literature) *(paper-reported, unverified here)* | **embeddable — cheapest of the three.** 4 counters + 4 shift amounts per channel (~12 B/ch, ~1.5 KB at 128 ch), one compare + one saturating add per tap per sample, multiply-free shift update. Est. cost ≈ 0.045; comfortably inside the 125-cyc neural budget | **Not retired `LMS4rs`** (cycle 14, P2): that forked whole coefficient **banks** by activity regime, splitting the adaptation data. Here there is exactly **one** coefficient set seeing **every** sample; only the learning rate is modulated. **Not retired `LMS4v2`** (cycle 21, P2 extension): that added a quadratic Volterra term and found no exploitable nonlinearity — this changes the *adaptation law*, not the predictor's polynomial form. **Not a P7 widening**: the counter is continuous scalar state, not an argmin over K hypotheses. **Risk:** over-annealing lags burst onsets, raising residual energy exactly where samples are expensive — clamp s_i to a narrow range (e.g. 0..3) so the worst case is within 8× of the incumbent step |
-| 4 | **Scale-selected spatial front-end** — gate `LMS4+Rice+xchan_mst`'s Chow-Liu tree (tight arrays) vs plain best-partner (large arrays) on the decoder-observable channel count | Tried 3 ways (MDL in-sample selection, backward rank-statistic, per-channel MDL+hysteresis) — all landed at or below the best of their own branches (P7); a *decoder-observable* channel-count gate (the only form proven to work, via `acar_sel`) is untried for this specific pairing | **embeddable** (both branches already verified; gate mechanism proven elsewhere) | P7's winner's-curse finding predicts a small or null result — budget accordingly, don't assume the branches' peak. Carried over, re-ranked below the three new mechanisms |
-| 5 | **FLAC fixed polynomial predictors (0–3), best-per-block + Rice** | cheapest upgrade over order-1 delta; near-LMS ratio at a fraction of the compute | **embeddable — shipped** (`fixed0-3+Rice`, on the Pareto front) | the value pick; already registered |
-| 6 | **NLMS / leaky sign-LMS + Rice** (MPEG-4 ALS RLS-LMS direction) | normalised/leaky adaptation may track non-stationary EMG better, still one-pass | **embeddable** | our search shows order>4 *hurts* real HD-sEMG — keep order small (P2). Note #3 above is the *narrow, divisionless* realization of this row's idea — prefer it over a full NLMS (which needs a divide/reciprocal) |
-| 7 | **JPEG-LS / LOCO-I(-ANS) 2D over the grid×time image** | MED/LOCO predictor + context + Golomb exploits 2D spatial structure; LOCO-ANS is a proven low-complexity FPGA encoder | **partially spent — borderline** | the *bias-cancellation* half of JPEG-LS is now proven positive and shipped (P9, `LMS4bc+Rice+xchan_bestpartner`); the *MED/LOCO predictor itself* (replacing the linear LMS, not just correcting its residual mean) remains untried. Entropy-context on the Rice parameter is still spent (P5) |
+| 1 | **`bcxm` — mixed-moment context word for the headline bias corrector.** Keep `LMS4bc`'s 30-bucket, scale-free, divisionless machinery verbatim (leaky per-context mean, thresholds at 0.5x/1.5x the channel's backward leaky mean abs(e), shift-only) and swap **exactly one slot**: the weakest own-channel slot `q2(e[g,t-2])` (3 levels) is replaced by the 3-level **spatial residual-gradient sign** `sgn(d[g-1,t-1] - d[g-cols,t-1])` that `bcxs` proved carries cross-channel MI. Word stays `q1(e[t-1]) x q_spatial x sgn(parent)` = 5x3x2 = **30 buckets, unchanged budget** | **Bias-stage lever (P9), new axis: context COMPOSITION at fixed budget.** The two shipped correctors win on disjoint dataset pairs and index **different moments** of the same residual: the headline's quantized-magnitude slots index the residual's *scale* (which multiplies the sign-sign LMS's misadjustment offset, so E[e ; ctx] grows with local activity), while `bcxs`'s spatial-gradient sign indexes the *direction of local activity* on the one axis that still carries MI after LMS whitening (P1/P9-refined). Information-theoretically the two slots are near-orthogonal indices of E[e ; ctx]: `I(e; q_mag, q_spatial) ~ I(e; q_mag) + I(e; q_spatial)` to the extent the two statistics are conditionally independent, so at **fixed** bucket count the composed word should lower `H(e - E[e ; ctx])` further than either alone, with **no** extra dilution (P9's refined exchange rate is paid only when the bucket count grows or a slot is uninformative). The slot deleted is the one P9's theory calls weakest — a second own-channel *temporal* lag, on the axis the order-4 predictor has already whitened (P5's mechanism). This is the single-variable test of whether the two correctors' wins are **additive or substitutes** | **embeddable** — state and ops are `LMS4bc`'s (30 x int32 leaky accumulators + one leaky abs(e) scale per channel, ~130 B/ch, ~17 KB at 128 ch) plus **one subtract and one sign test** to form the gradient, minus the compares freed by dropping `q2`. No multiply, no divide, no new side-info, no new state class. Est. cost ~= `LMS4bc`'s 0.12 (within +/-5%); `LMS4bc` already passes both the sEMG and the 125-cyc neural budget. Prefer the **previous-slice** gradient `d[.,t-1]` (as `bc` already does for the parent term) so the time-major, channel-vectorized loop and its decoder are kept verbatim; a same-slice gradient is also legal but forces `bcxs`'s sequential per-channel inner pass | **Not a bucket-count sweep** (P9-refined dead end): the count is pinned at 30 and the 5x3x2 factorization is unchanged — only *which variable* fills one slot moves. **Not retired `xctx`** (P5): that conditioned the Rice parameter k, a back-end lever; this corrects the residual stream upstream of an untouched coder. **Not a re-proposal of `bcxs`** (registered, kept): `bcxs` replaced the whole 27-bucket sign word of `bc_lite`; this changes one slot of the *30-bucket magnitude* word of the headline, i.e. it is the first codec to hold **both** winning slot classes at once. **Honest risk:** if the two wins are substitutes (the same MI reached two ways), the result is a tie with the better parent on each set — still a real, P9-sharpening result. On the CapgMyo negative control expect the spatial slot to cost ~the same -0.045 pp `bcxs` paid (P1: no neighbour MI to index), which row #4's gate exists to recover |
+| 2 | **`xchan_cmean` — composite (noise-averaged) parent with ONE fitted gain.** For each channel form a single virtual parent `m[g,t] = (sum_i s_i * x[i,t]) >> log2(K)` over its **causal** grid neighbours (left, up, up-left, up-right; off-grid contribute 0), where `s_i` in {+1,-1} is a backward alignment sign from the previous reconstructed block's inner product (differential arrays can have anti-correlated neighbours). Then apply the family's existing rank-1 subtract with **one** integer-LS gain fitted against `m`: `y[g] = x[g] - ((beta_g * m[g]) >> s)`; LMS4 + Rice downstream unchanged, parents left bit-clean | **Spatial lever (P1, the dominant one), new axis: the QUALITY OF THE REGRESSOR, not the size of the hypothesis class.** Write each neighbour as `x_i = s + n_i`: a shared volume-conducted mode `s` (P6 settled it is **instantaneous**, so the neighbours are in phase and may be summed without any lag search) plus a locally-generated part `n_i` that is approximately independent across electrodes. Regressing on ONE neighbour is a textbook errors-in-variables problem: the LS gain is attenuated by `SNR/(1+SNR)` and the achievable residual variance is `sigma^2 (1 - rho^2 * SNR/(1+SNR))`, so regressor noise directly caps how much of the shared mode a rank-1 subtract can remove. Averaging K in-phase neighbours multiplies the regressor SNR by ~K (shared mode adds coherently, independent parts add in power), which raises `rho_eff^2` and lowers the residual variance — the coded rate falls by 1/2 log2 of that variance ratio. Crucially this **shrinks** the free-parameter count instead of growing it: one gain and **zero** selection, versus best-partner's (parent index + gain). P7 says every widened backward search here has paid selection variance for MI that was not there; this is the same constraint attacked from the other side — reduce the estimator's variance at fixed model order. Basis: classical attenuation/regression-dilution theory (Fuller, *Measurement Error Models*); composite/matrixed reference channels are standard in lossless multichannel audio (Dolby TrueHD/MLP integer matrixing, US 7,392,195) and in multichannel biosignal coders that pair channels by cross-correlation (Rzepka, *Biomed. Signal Process. Control* 57:101705, 2020) *(paper-reported, unverified here)* | **embeddable — cheaper than the incumbent front-end.** Per sample-channel: 3 adds + 1 shift to form `m`, then the family's 1 multiply + 1 shift + 1 subtract; the per-block backward beta fit is **one** integer-LS solve instead of `bestpartner_adaptive`'s 4-candidate scored scan, so the honest op count should come in **below** it (count it explicitly — cycle 28's `xlag_v5` failed verification precisely by under-counting selection scoring). State: K alignment sign bits + one beta per channel (~4 B/ch) + the current reconstructed time slice (~256 B at 128 ch). Est. cost 0.040–0.050, i.e. the `bestpartner`/`mst` corner; fits the 2 kS/s budget with room and plausibly the 125-cyc neural budget | **Not retired `xchan_multiparent`** (cycle 8): that summed **two independently fitted marginal** subtracts (`beta_1 + beta_2 ~ 2 beta`), which double-counts the shared mode. Here there is **one** regressor and **one** gain fitted against it — the exact LS solution restricted to the equal-weight direction, which structurally cannot over-subtract. **Not retired `xchan_hint`** (P11): no parity split (all causal neighbours stay available to every channel) and the gain is **fitted**, not unity/convex — P11's stated failure was mis-specifying the neighbour amplitude ratio, and its stated escape hatch is exactly a fitted-gain multi-neighbour form. **Partial revival, declared:** the retired always-on `LMS4+Rice+acar+bestpartner` also subtracts a mean of many channels — but **globally** and at **unity gain**; this is **local** (matching P1's finding that shared content on large arrays is spatially local) and **fitted** (so it degrades gracefully to identity where no shared mode exists, instead of injecting the array mean's noise). **Not `jointbp2`** (P1b): that spends 2 free taps plus a pair search; this spends 1 tap and no search — the opposite corner of the bias/variance trade. **Not multi-tap (P3)**: predict-only, parents untouched, one rank-1 removal. **Honest risks:** (i) where one dominant neighbour carries nearly all the MI (P1b says tight arrays are essentially rank-1) the average dilutes the good parent with weaker ones — expect neutral, not negative, since beta re-fits; (ii) on the differential CapgMyo control the alignment signs are load-bearing — if they mis-estimate, the composite can cancel and the codec degrades toward *no* spatial stage, which is worse than best-partner. Report the isolated cross-channel gain against the shared `LMS+Rice` null, as P11 did |
+| 3 | **`bcpool` — cross-channel pooled (shrunk) bias statistics.** Keep the context class, the bucket count, the update law and the bitstream of the chosen bias corrector **byte-identical**; change only *how each bucket's mean is estimated*. Alongside the per-channel accumulator `S_c[q]`, maintain **one array-wide** accumulator `S_bar[q]` fed by every channel's sample in bucket `q`, and apply the shrunk correction `mu = ((2^w - 1) * mu_c[q] + mu_bar[q]) >> w` with a **fixed** power-of-two weight (e.g. w = 2). Pooled accumulators are updated at the **end** of each time slice, so the estimate used at time t depends only on slices < t — decoder-reproducible, zero side-info | **Bias-stage lever (P9), new axis: the ESTIMATOR's sample support, not the context's definition.** P9's refinement identifies the binding constraint exactly: *context relevance is bought with context dilution* — each bucket's leaky mean is estimated from ~1/NCTX of a channel's samples, so estimation variance, not available MI, is what caps context richness. Pooling multiplies a bucket's sample support by the channel count (128–320 here), cutting estimator variance by the same factor, at the cost of a bias equal to the channel's deviation from the array-mean bias. Stein's phenomenon / empirical Bayes gives the condition precisely: a convex combination of the per-channel and pooled estimates has **strictly lower MSE** than the per-channel estimate whenever the between-channel spread of the true `E[e ; ctx]` is small relative to the per-channel estimation variance — the small-correction, few-samples-per-bucket regime this stage demonstrably lives in (the shipped corrections are int8-clamped and worth tenths of a percent). A lower-MSE estimate of `E[e ; ctx]` subtracts closer to the true conditional mean, so the law of total variance bites harder and `H(e - mu)` falls further — the same principle two-level context models use in CM/CALIC-class coders. Basis: James–Stein / Efron–Morris shrinkage; the corrector machinery is this registry's own measured construction | **embeddable — and the only candidate that can *lower* the bias family's cost.** Shrinkage form: incumbent state + one array-wide table (30 x int32 ~ 130 B **total**, not per channel) + 1 add + 1 shift per sample-channel; est. cost ~= incumbent's 0.10–0.12. **Pure-pooled corner** (w = 0: drop the per-channel tables entirely): state collapses from ~130 B/ch (~17 KB at 128 ch) to ~130 B for the whole array — a >100x cut in the bias stage's dominant memory term, est. cost 0.05–0.06, which would put a bias-corrected codec on the cheap end of the Pareto front for the first time. Integer, divisionless, causal, zero side-info. **Implementation note:** requires the **time-major** loop (`bc`'s existing `for t: vectorized over channels` form, not `bc_lite`/`bcxs`'s channel-major pass), since a shared table's update order must match on both sides — this is also the on-node order, so it is a fidelity improvement, not a compromise | **Not a bucket-count sweep and not a new context class** (both P9-refined axes are held fixed — that is the point: this is the first orthogonal knob on this stage). **Not a backward argmin** (P7): nothing is selected, the weight is a fixed constant, so there is no winner's-curse surface. **Not `LMS4rs`** (retired, P2): that *split* adaptation data across predictor banks; this *merges* estimation data across channels — the opposite operation, and applied to a scalar mean rather than a 4-tap filter. **Honest risk:** channel amplitude heterogeneity (electrode impedance, distance to the innervation zone — the physical non-uniformity P11 named) biases the pooled mean; the fixed shrinkage weight bounds the damage by keeping the per-channel estimate dominant, and the pure-pooled corner should be reported separately since it is the one at risk. Composable with #1 and #4 — but measure it on the *unchanged* incumbent context first, so the estimator effect is isolated |
+| 4 | **`bcxs_sel` — MI-gate the bias corrector's context class** (INSIGHTS frontier #1, carried over, re-ranked). Select `bcxs`'s cross-channel-gradient context where neighbour correlation is high and fall back to `bc_lite`'s own-channel temporal context where it is not; **decoder-observable, zero-side-info, fixed threshold** (channel count / array geometry as `acar_sel` already proves, or a backward neighbour-correlation statistic from the previous reconstructed block) | Both branches are already measured with **opposite-signed** isolated effects that track neighbour MI exactly (positive on all three monopolar arrays, negative on the differential control), so a fixed-threshold selector collects each set's better branch with no new mechanism | **embeddable** — both branches verified; gate mechanism proven by `acar_sel`. Prefer a **recording-level** gate so only one table set is ever instantiated (a per-block gate would need both, doubling state) | **Ceiling correction (2026-08-22):** a two-way gate can only reach the max of its own branches per set (P7), and neither branch holds the OTB corner — that is the headline's 30-bucket quantized-magnitude context, a third class this gate never selects. Expect a strong mean-real/cost Pareto point, **not** the headline. Best run *after* #1 settles which context word is the better spatial branch |
+| 5 | **Scale-selected spatial front-end** — gate `LMS4+Rice+xchan_mst`'s Chow-Liu tree (tight arrays) vs plain best-partner (large arrays) on the decoder-observable channel count | Tried 3 ways (MDL in-sample selection, backward rank-statistic, per-channel MDL+hysteresis) — all landed at or below the best of their own branches (P7); a *decoder-observable* channel-count gate (the only form proven to work, via `acar_sel`) is untried for this specific pairing | **embeddable** (both branches already verified; gate mechanism proven elsewhere) | P7's winner's-curse finding predicts a small or null result — budget accordingly, don't assume the branches' peak. Carried over, re-ranked below the three new mechanisms |
+| 6 | **FLAC fixed polynomial predictors (0–3), best-per-block + Rice** | cheapest upgrade over order-1 delta; near-LMS ratio at a fraction of the compute | **embeddable — shipped** (`fixed0-3+Rice`, on the Pareto front) | the value pick; already registered |
+| 7 | **NLMS / leaky sign-LMS + Rice** (MPEG-4 ALS RLS-LMS direction) | normalised/leaky adaptation may track non-stationary EMG better, still one-pass | **embeddable** | our search shows order>4 *hurts* real HD-sEMG — keep order small (P2). Note #3 above is the *narrow, divisionless* realization of this row's idea — prefer it over a full NLMS (which needs a divide/reciprocal) |
+| 8 | **JPEG-LS / LOCO-I(-ANS) 2D over the grid×time image** | MED/LOCO predictor + context + Golomb exploits 2D spatial structure; LOCO-ANS is a proven low-complexity FPGA encoder | **partially spent — borderline** | the *bias-cancellation* half of JPEG-LS is now proven positive and shipped (P9, `LMS4bc+Rice+xchan_bestpartner`); the *MED/LOCO predictor itself* (replacing the linear LMS, not just correcting its residual mean) remains untried. Entropy-context on the Rice parameter is still spent (P5) |
 
 ## Watch-list — DO NOT promote without human approval
 
@@ -154,7 +290,29 @@ bar, not a candidate.
 - The entropy back-end is at the floor — Rice is optimal for the near-geometric
   residual; neither an ANS swap nor any context-model of the Rice parameter helps (P5).
 
-**Boundary clarification for candidate #1 (added 2026-08-19).** "Single rank-1
+**Boundary clarification for the 2026-08-22 candidate #2 (`xchan_cmean`).** The
+settled fact above rules out (a) *energy-preserving multi-tap rotations* that
+corrupt both channels (`iklt`, P3), (b) *summed independently-fitted marginal*
+subtracts that double-count the shared mode (`xchan_multiparent`, P1b), and now
+(c) *fixed unity-gain* multi-neighbour interpolation (`xchan_hint`, P11). A
+**composite parent** is none of these: the K neighbours are collapsed into **one
+regressor** before any fitting, and **one** gain is then fitted against it — so
+the model order stays exactly rank-1 (fewer free parameters than best-partner,
+which also spends a selection), it structurally cannot over-subtract (the gain
+is the LS solution for the regressor actually used), the parents stay bit-clean
+(predict-only), and the amplitude ratio is *fitted*, not assumed. What changes
+is the **measurement noise of the regressor**, which is a different axis from
+every one of (a)–(c): those were about the basis or the weights, this is about
+the SNR of the variable the basis is fitted against. If it loses, the settled
+fact sharpens usefully to "the neighbour that carries the MI also carries the
+noise — averaging in weaker neighbours costs more shared-mode dilution than it
+buys in regressor SNR", which would close the composite-parent axis and leave
+selection as the only spatial estimator worth building.
+
+**Boundary clarification for the 2026-08-19 candidate #1 (`xhint`) — RESOLVED,
+kept for the record.** The hypothesis below was measured and **lost on all four
+real sets**; the settled fact strengthened exactly as the last sentence
+predicted, and the sidedness axis is now closed (INSIGHTS **P11**). "Single rank-1
 adaptive subtract" was established against (a) *energy-preserving multi-tap
 rotations* that corrupt both channels (`iklt`, P3) and (b) *summed
 independently-fitted marginal* subtracts that double-count the shared mode
@@ -167,7 +325,39 @@ settled fact strengthens to "one-sided rank-1 is not merely sufficient, the
 interleaving cost on the coarse half exceeds the interpolation gain on the fine
 half" — which would close the scan-order axis too.
 
-### Literature added this cycle
+### Literature added this cycle (2026-08-22)
+- W. A. Fuller, *Measurement Error Models* (Wiley, 1987) — classical
+  errors-in-variables attenuation: a regression slope fitted against a noisy
+  regressor is biased toward zero by `SNR/(1+SNR)`, capping the variance a
+  rank-1 subtract can remove. Grounding for the composite-parent argument in #2
+  *(textbook result, unverified on this corpus)*.
+- Dolby TrueHD / MLP lossless multichannel matrixing (US 7,392,195 and
+  US 8,239,210, "Lossless multi-channel audio codec") — integer, reversible
+  matrixed/composite reference channels in a shipping lossless codec; the
+  industrial precedent for predicting from a *combination* of channels rather
+  than one *(patent-reported, unverified here)*.
+- D. Rzepka, "Low-complexity lossless multichannel ECG compression based on
+  selective linear prediction", *Biomedical Signal Processing and Control*
+  57:101705, 2020 — cross-channel correlation used to pair strongly dependent
+  channels for a second decorrelation stage in a low-complexity portable coder;
+  the closest published relative of this registry's spatial front-end family
+  *(paper-reported, unverified here)*.
+- B. Efron & C. Morris, "Stein's estimation rule and its competitors — an
+  empirical Bayes approach", *JASA* 68(341), 1973 (and the James–Stein result it
+  builds on) — pooling many small, noisily-estimated means toward a common
+  centre strictly lowers total MSE in exactly the small-effect / low-sample
+  regime the bias corrector's buckets occupy. Grounding for #3
+  *(classical result, unverified on this corpus)*.
+- Weinberger, Seroussi & Sapiro, "The LOCO-I lossless image compression
+  algorithm: principles and standardization into JPEG-LS", *IEEE TIP* 9(8),
+  2000 — the divisionless per-context bias corrector both #1 and #3 modify;
+  cited here for the *context-word design* discipline (few, well-populated
+  buckets), not for a ratio claim *(paper-reported, unverified here)*.
+
+### Literature added 2026-08-19
+_(the #1/#2/#3 below refer to the **2026-08-19** slate — `xhint`, `bcxs`,
+`LMS4vs` — not to the current table.)_
+
 - Roos & Viergever, *hierarchical interpolation (HINT)*; Aiazzi, Alparone &
   Baronti, "Lossless image compression based on optimal prediction, adaptive
   lifting, and conditional arithmetic coding", IEEE TIP 10(1):1–14, 2001
