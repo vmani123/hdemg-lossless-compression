@@ -187,22 +187,10 @@ XADAPT_SHIFT = ec.CROSS_SHIFT  # fixed-point scale for beta (matches the family)
 
 
 def _int_beta(num, den, shift=XADAPT_SHIFT):
-    """Integer-only fixed-point gain ~= round(num/den * 2**shift) for den > 0,
-    clamped to int16. No float anywhere; deterministic and therefore identical
-    on encode and decode. `den` is a sum of squares so it is always >= 0."""
-    d = int(den)
-    if d <= 0:
-        return 0
-    numer = int(num) << shift
-    if numer >= 0:
-        b = (numer + d // 2) // d          # symmetric round-half-up
-    else:
-        b = -(((-numer) + d // 2) // d)
-    if b > 32767:
-        return 32767
-    if b < -32768:
-        return -32768
-    return b
+    """Integer-only fixed-point gain ~= round(num/den * 2**shift), half away
+    from zero, clamped to int16. One implementation for the whole family:
+    embedded_codec.int_beta (hdemg-bench S1)."""
+    return ec.int_beta(num, den, shift)
 
 
 def _beta_from_block(xc_blk, xp_blk, shift=XADAPT_SHIFT):
@@ -327,16 +315,11 @@ def _bp_candidates(g, cols, C):
 
 def _bp_opt_beta(xg, xp, shift):
     """Rounded integer least-squares gain beta ~ <xg,xp>/<xp,xp> * (1<<shift).
-    Integer-only (rounded division), clamped to int16 side-info range."""
+    Integer-only (rounded division), clamped to int16 side-info range.
+    Same arithmetic as before; now via embedded_codec.int_beta."""
     denom = int((xp * xp).sum())
-    if denom <= 0:
-        return 0
-    num = int((xg * xp).sum()) << shift
-    if num >= 0:
-        b = (num + denom // 2) // denom
-    else:
-        b = -(((-num) + denom // 2) // denom)
-    return max(-32768, min(32767, b))
+    num = int((xg * xp).sum())
+    return ec.int_beta(num, denom, shift)
 
 
 def _bp_score(res1d):

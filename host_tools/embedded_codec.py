@@ -191,23 +191,39 @@ def grid_parents(channels, cols):
 CROSS_SHIFT = 8
 
 
+def int_beta(num, den, shift=CROSS_SHIFT):
+    """Fixed-point gain round(num / den * 2**shift) computed on the exact
+    rational with ONE integer division and no float: half away from zero,
+    0 when den <= 0, clipped to int16. Deterministic on every platform, so
+    the C port (hdemg-bench codec/) and the RTL reproduce it bit for bit.
+    This is the rule research/registry.py always used for its adaptive and
+    best-partner betas; from S1 on it is the family-wide rule."""
+    d = int(den)
+    if d <= 0:
+        return 0
+    n = int(num)
+    mag = ((abs(n) << shift) + d // 2) // d
+    b = -mag if n < 0 else mag
+    return max(-32768, min(32767, b))
+
+
 def cross_betas(x, parent, shift=CROSS_SHIFT):
     """Optimal fixed per-channel gain beta (fixed-point) for predicting a channel
     from its parent: beta ~ <x_c, x_p> / <x_p, x_p>. Sent as tiny side-info
     (one int16 per channel). Adapting the gain -- rather than subtracting the
     neighbour outright -- is what stops the independent noise floor from being
     doubled when correlation is low (beta -> 0), while still cancelling the
-    shared spatial signal when correlation is high (beta -> 1<<shift)."""
+    shared spatial signal when correlation is high (beta -> 1<<shift).
+    Integer only since hdemg-bench S1 (see int_beta)."""
     x = x.astype(np.int64)
     betas = np.zeros(x.shape[0], np.int64)
     for g in range(x.shape[0]):
         p = parent[g]
         if p < 0:
             continue
-        denom = int((x[p] * x[p]).sum())
-        if denom > 0:
-            b = int(round((x[g] * x[p]).sum() / denom * (1 << shift)))
-            betas[g] = max(-32768, min(32767, b))
+        num = int((x[g] * x[p]).sum())
+        den = int((x[p] * x[p]).sum())
+        betas[g] = int_beta(num, den, shift)
     return betas
 
 
@@ -363,6 +379,28 @@ def _known_answer_tests():
     assert bits_per_sample <= 1.05, (
         f"all-zero residual coded at {bits_per_sample:.3f} bits/sample, "
         f"expected ~1.0 -- k-selection or stop-bit logic likely broken")
+
+    # 4) Integer cross-channel gain (hdemg-bench S1, ruling R1): beta is the
+    # exact rational num/den scaled by 2**shift, rounded HALF AWAY FROM ZERO,
+    # with no float anywhere. Ties are the only inputs where this differs from
+    # the old float pipeline (Python round() is half-even): 0.5 -> 1 here, 0 there.
+    assert int_beta(0, 0) == 0 and int_beta(5, 0) == 0, "den=0 must give 0"
+    assert int_beta(1, 1) == 256, "exact 1.0 -> 256"
+    assert int_beta(1, 512) == 1 and int_beta(-1, 512) == -1, "tie 0.5 -> away from zero"
+    assert int_beta(3, 512) == 2 and int_beta(-3, 512) == -2, "tie 1.5 -> 2"
+    assert int_beta(1, 1024) == 0 and int_beta(1, 1000) == 0, "below half -> 0"
+    assert int_beta(2, 1000) == 1, "0.512 -> 1"
+    assert int_beta(200, 1) == 32767 and int_beta(-200, 1) == -32768, "clip to int16"
+    assert int_beta(7, 3, shift=0) == 2, "shift honoured: 7/3 -> 2"
+    # random dot-product-sized inputs: agrees with the float formula everywhere
+    # except exact ties, which must land on the away-from-zero side
+    for _ in range(2000):
+        num = int(rng.integers(-2**38, 2**38))
+        den = int(rng.integers(1, 2**38))
+        got = int_beta(num, den)
+        flt = max(-32768, min(32767, int(round(num / den * 256))))
+        tie = (2 * ((abs(num) << 8) % den)) == den
+        assert got == flt or tie, f"int_beta({num},{den})={got} vs float {flt}, not a tie"
 
     print("known-answer tests: zigzag KAT, independent Rice decoder cross-check "
           f"({len(test_lengths)} lengths x 5 scales), all-zero floor -- ALL PASSED")
