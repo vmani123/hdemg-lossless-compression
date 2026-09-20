@@ -62,9 +62,9 @@ codecs; it is not a real-time-fit proof.
 ### Gap 2 — The ratio and the `embedded_ok` verdict describe *different programs* (the big one)
 The metadata for `LMS+Rice+xchan` declares `causal=True, lookahead=256,
 integer_only=True`. The code that actually produced its leaderboard ratio computes
-the cross-channel gain `beta` as a **floating-point least-squares ratio over the
-entire recording** (`embedded_codec.cross_betas`: `round(<x_c,x_p>/<x_p,x_p> *
-2^shift)` with `.sum()` over all N). Audit 1 proves it: perturb **only the future
+the cross-channel gain `beta` as a **least-squares ratio over the entire recording**
+(integer since experiments/036; float before) (`embedded_codec.cross_betas`:
+`round(<x_c,x_p>/<x_p,x_p> * 2^shift)` with `.sum()` over all N). Audit 1 proves it: perturb **only the future
 half** of the signal and **22032 / 24000 of the *past* residuals change** — the
 encoder demonstrably read samples it hasn't reached yet. So the number on the
 leaderboard was measured on an **offline, float, non-streaming** encoder, while

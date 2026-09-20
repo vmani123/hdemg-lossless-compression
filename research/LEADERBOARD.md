@@ -9,6 +9,9 @@ the append-only cross-cycle ledger is `CYCLE_LOG.md`, and the durable *why* is
 proves (short version: the headline `+xchan` ratios are measured with an offline
 whole-signal beta; the on-node figure is the backward-adaptive variant's).
 
+_Note 2026-09-19: `embedded_codec.cross_betas` is integer-only from this date (half away from zero,
+`experiments/036_integer_beta.md`). Every `+xchan` ratio below moved by < 0.01 %; the table is not re-run._
+
 _Last updated **2026-08-22** (branch `compression-cycle-2026-08-22`,
 `CYCLE_LOG.md` rows 34–36, `results/cycle_bench.csv` + `results/cycle_search.csv`,
 all four real sets at 15 000 samples). Three candidates measured —
